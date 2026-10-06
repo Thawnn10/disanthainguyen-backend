@@ -11,7 +11,9 @@ app.use(express.json({ limit: '256kb' }));
 
 /* ---------- ENV CHECK ---------- */
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const MODEL_NAME = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+
+// ⭐ ĐÃ CẬP NHẬT: Sử dụng model mới nhất thay thế gemini-2.0-flash đã bị khai tử
+const MODEL_NAME = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
 
 console.log('========================================');
 console.log('[BOOT] Port:', PORT);
@@ -52,7 +54,6 @@ PHONG CÁCH:
 function getResponseText(response) {
     if (!response) return '';
     try {
-        // SDK mới: response.text là một PROPERTY, không phải function
         if (typeof response.text === 'string') return response.text;
     } catch (e) { }
     try {
@@ -94,7 +95,6 @@ app.post('/api/chat', async (req, res) => {
         });
     }
 
-    /* ⚠️ KHÔNG dùng Google Search — chỉ gọi model thuần */
     let response;
     try {
         console.log('[CHAT] Gọi Gemini (KHÔNG search)...');
@@ -105,7 +105,6 @@ app.post('/api/chat', async (req, res) => {
                 systemInstruction: SYSTEM_INSTRUCTION,
                 temperature: 0.3,
                 maxOutputTokens: 1200
-                // KHÔNG có tools: [{ googleSearch: {} }]
             }
         });
         console.log('[CHAT] ✅ Gemini trả về sau', Date.now() - t0, 'ms');
@@ -122,7 +121,7 @@ app.post('/api/chat', async (req, res) => {
         } else if (/quota|rate|429|RESOURCE_EXHAUSTED/i.test(msg)) {
             hint = 'Đã vượt quota/giới hạn tốc độ. Chờ vài phút rồi thử lại.';
         } else if (/not found|404|model/i.test(msg)) {
-            hint = `Model "${MODEL_NAME}" không khả dụng với key này. Thử đổi biến môi trường GEMINI_MODEL=gemini-2.0-flash hoặc gemini-1.5-flash.`;
+            hint = `Model "${MODEL_NAME}" không khả dụng. Thử đổi biến môi trường GEMINI_MODEL=gemini-3.8-flash.`;
         } else if (/timeout|DEADLINE/i.test(msg)) {
             hint = 'Gemini phản hồi quá chậm.';
         }
