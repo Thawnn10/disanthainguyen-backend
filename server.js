@@ -12,13 +12,12 @@ app.use(express.json({ limit: '256kb' }));
 /* ---------- ENV CHECK ---------- */
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// Model chính
-const PRIMARY_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+// ⚠️ TÊN MODEL PHẢI LÀ MODEL THẬT CỦA GOOGLE
+const PRIMARY_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
-// Danh sách model fallback theo thứ tự ưu tiên (nếu model chính quá tải)
 const FALLBACK_MODELS = (
     process.env.GEMINI_FALLBACK_MODELS ||
-    'gemini-3.7-flash,gemini-3.5-flash,gemini-2.5-flash'
+    'gemini-2.0-flash,gemini-2.0-flash-lite,gemini-flash-latest'
 ).split(',').map(s => s.trim()).filter(Boolean);
 
 console.log('========================================');
@@ -26,7 +25,7 @@ console.log('[BOOT] Port:', PORT);
 console.log('[BOOT] Primary model:', PRIMARY_MODEL);
 console.log('[BOOT] Fallback models:', FALLBACK_MODELS.join(' → '));
 console.log('[BOOT] GEMINI_API_KEY:', GEMINI_API_KEY
-    ? `✅ Có (${GEMINI_API_KEY.slice(0,10)}...${GEMINI_API_KEY.slice(-4)})`
+    ? `✅ Có (${GEMINI_API_KEY.slice(0, 10)}...${GEMINI_API_KEY.slice(-4)})`
     : '❌ THIẾU');
 console.log('========================================');
 
@@ -61,7 +60,7 @@ PHONG CÁCH:
 function getResponseText(response) {
     if (!response) return '';
     try {
-        if (typeof response.text === 'string') return response.text;
+        if (typeof response.text === 'string' && response.text) return response.text;
     } catch (e) { }
     try {
         const parts = response.candidates?.[0]?.content?.parts || [];
@@ -74,7 +73,6 @@ function isRetryableError(err) {
     const msg = (err?.message || String(err)).toLowerCase();
     const status = err?.status || err?.code;
 
-    // 503 UNAVAILABLE, 429 RESOURCE_EXHAUSTED, 500 INTERNAL, 502, 504, timeout
     if (status === 503 || status === 429 || status === 500 || status === 502 || status === 504) return true;
     if (/unavailable|overloaded|high demand|resource_exhausted|rate limit|timeout|deadline|try again later/i.test(msg)) return true;
     return false;
@@ -82,7 +80,6 @@ function isRetryableError(err) {
 
 /* ---------- HELPER: exponential backoff delay với jitter ---------- */
 function backoffDelay(attempt) {
-    // 1s, 2s, 4s, 8s + jitter 0-500ms
     const base = Math.min(1000 * Math.pow(2, attempt), 8000);
     const jitter = Math.floor(Math.random() * 500);
     return base + jitter;
@@ -104,13 +101,20 @@ async function callGeminiWithRetry(message, maxRetriesPerModel = 3) {
 
                 const response = await ai.models.generateContent({
                     model: modelName,
-                    contents: message,
+                    contents: [
+                        { role: 'user', parts: [{ text: message }] }
+                    ],
                     config: {
                         systemInstruction: SYSTEM_INSTRUCTION,
                         temperature: 0.3,
                         maxOutputTokens: 1200
                     }
                 });
+
+                const text = getResponseText(response);
+                if (!text || !text.trim()) {
+                    throw new Error('Model trả về nội dung rỗng');
+                }
 
                 console.log(`[GEMINI] ✅ Thành công với model="${modelName}" attempt=${attempt + 1}`);
                 return { response, modelUsed: modelName };
@@ -120,16 +124,13 @@ async function callGeminiWithRetry(message, maxRetriesPerModel = 3) {
                 const status = err?.status || err?.code;
 
                 console.error(`[GEMINI] ❌ model="${modelName}" attempt=${attempt + 1} status=${status} msg=${msg}`);
-
                 errors.push({ model: modelName, attempt: attempt + 1, status, message: msg });
 
                 if (!isRetryableError(err)) {
-                    // Lỗi không thể retry (API key sai, model không tồn tại...) → nhảy sang model tiếp theo
                     console.log(`[GEMINI] ⏭️ Lỗi không thể retry, bỏ qua model="${modelName}"`);
                     break;
                 }
 
-                // Nếu còn lượt retry cho model này → chờ rồi thử lại
                 if (attempt < maxRetriesPerModel - 1) {
                     const delay = backoffDelay(attempt);
                     console.log(`[GEMINI] ⏳ Chờ ${delay}ms trước khi retry...`);
@@ -140,13 +141,12 @@ async function callGeminiWithRetry(message, maxRetriesPerModel = 3) {
         console.log(`[GEMINI] 🔄 Chuyển sang model fallback tiếp theo...`);
     }
 
-    // Tất cả model đều thất bại
-    const lastError = errors[errors.length - 1];
+    const lastError = errors[errors.length - 1] || {};
     const error = new Error(
-        `Tất cả model đều thất bại sau nhiều lần thử. Lỗi cuối: [${lastError?.model}] ${lastError?.message}`
+        `Tất cả model đều thất bại. Lỗi cuối: [${lastError.model || '?'}] ${lastError.message || 'unknown'}`
     );
     error.errors = errors;
-    error.status = lastError?.status || 503;
+    error.status = lastError.status || 503;
     throw error;
 }
 
@@ -198,9 +198,9 @@ app.post('/api/chat', async (req, res) => {
         } else if (/quota|rate limit|resource_exhausted|429/i.test(msg)) {
             hint = 'Đã vượt quota. Chờ 1-2 phút rồi thử lại.';
         } else if (/unavailable|overloaded|high demand|503/i.test(msg)) {
-            hint = 'Google đang quá tải tạm thời. Hệ thống đã thử lại nhiều lần nhưng chưa thành công. Vui lòng thử lại sau 30-60 giây.';
+            hint = 'Google đang quá tải tạm thời. Vui lòng thử lại sau 30-60 giây.';
         } else if (/not found|404|model/i.test(msg)) {
-            hint = 'Model không khả dụng. Thử đổi biến môi trường GEMINI_MODEL=gemini-2.5-flash.';
+            hint = 'Model không khả dụng. Kiểm tra biến môi trường GEMINI_MODEL — dùng gemini-2.5-flash.';
         }
 
         return res.status(503).json({
