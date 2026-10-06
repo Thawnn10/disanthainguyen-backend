@@ -317,6 +317,92 @@ app.get('/health/deep', async (req, res) => {
 /* ------------------------------------------------------------
  * 404 + ERROR HANDLER
  * ---------------------------------------------------------- */
+/* ------------------------------------------------------------
+ * ROOT — trang thông tin nhanh khi truy cập domain
+ * ---------------------------------------------------------- */
+app.get('/', (req, res) => {
+    const html = `<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Di Sản Thái Nguyên · Backend API</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+       background:linear-gradient(135deg,#262019 0%,#322A22 100%);
+       color:#F7F1E5;min-height:100vh;display:flex;align-items:center;justify-content:center;
+       padding:24px;line-height:1.6}
+  .box{max-width:640px;width:100%;background:linear-gradient(135deg,rgba(72,60,49,.88),rgba(54,45,36,.94));
+       border:1px solid rgba(212,168,83,.35);border-radius:20px;padding:32px;
+       box-shadow:0 20px 60px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.1)}
+  h1{font-family:Georgia,serif;font-size:1.8rem;color:#D4A853;margin-bottom:6px}
+  .sub{color:#C8BAA0;font-size:.9rem;margin-bottom:24px}
+  .badge{display:inline-block;background:linear-gradient(135deg,#B8860B,#D4A853);
+         color:#1A0F00;font-size:.7rem;font-weight:700;letter-spacing:.08em;
+         text-transform:uppercase;padding:5px 12px;border-radius:20px;margin-bottom:14px}
+  .status{display:flex;align-items:center;gap:8px;font-size:.9rem;margin-bottom:20px;
+          padding:12px 16px;background:rgba(76,175,80,.12);border-radius:12px;
+          border:1px solid rgba(76,175,80,.3);color:#A8E6B0}
+  .dot{width:8px;height:8px;border-radius:50%;background:#4CAF50;
+       box-shadow:0 0 10px #4CAF50;animation:p 1.5s infinite}
+  @keyframes p{0%,100%{opacity:1}50%{opacity:.4}}
+  h2{font-size:1rem;color:#D4A853;margin:22px 0 10px;font-family:Georgia,serif}
+  ul{list-style:none}
+  li{margin-bottom:10px;font-size:.9rem;color:#C8BAA0}
+  code{background:rgba(0,0,0,.35);color:#E8C87A;padding:3px 8px;border-radius:6px;
+       font-family:'SF Mono',Monaco,monospace;font-size:.85rem}
+  a{color:#E8C87A;text-decoration:none;border-bottom:1px dashed rgba(212,168,83,.5)}
+  a:hover{color:#FFD700;border-bottom-color:#FFD700}
+  .method{display:inline-block;font-size:.7rem;font-weight:700;padding:2px 7px;
+          border-radius:5px;margin-right:8px;vertical-align:middle}
+  .get{background:rgba(76,175,80,.25);color:#A8E6B0}
+  .post{background:rgba(212,168,83,.25);color:#E8C87A}
+  .footer{margin-top:26px;padding-top:18px;border-top:1px dashed rgba(212,168,83,.25);
+          font-size:.78rem;color:#9A8F7E;text-align:center}
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="badge">Backend API</div>
+  <h1>Di Sản Thái Nguyên · Âm Vang Di Sản</h1>
+  <div class="sub">Dự án Khoa học Kỹ thuật — A1K64 THPT Phú Bình</div>
+
+  <div class="status">
+    <span class="dot"></span>
+    <strong>Server đang hoạt động</strong>
+    <span style="margin-left:auto;font-size:.8rem;color:#A8E6B0">model: ${MODEL_NAME}</span>
+  </div>
+
+  <h2>API Endpoints</h2>
+  <ul>
+    <li><span class="method post">POST</span><code>/api/chat</code> — Chat với Trợ lý AI Di sản</li>
+    <li><span class="method get">GET</span><code>/health</code> — Kiểm tra tình trạng cơ bản</li>
+    <li><span class="method get">GET</span><code>/health/deep</code> — Kiểm tra sâu (test Gemini API key)</li>
+  </ul>
+
+  <h2>Trạng thái cấu hình</h2>
+  <ul>
+    <li>API key: ${GEMINI_API_KEY ? '✅ Đã cấu hình' : '❌ <strong style="color:#FF6B6B">Chưa cấu hình GEMINI_API_KEY</strong>'}</li>
+    <li>Model: <code>${MODEL_NAME}</code></li>
+    <li>Uptime: ${Math.round(process.uptime())} giây</li>
+  </ul>
+
+  <h2>Liên kết</h2>
+  <ul>
+    <li>🌐 <a href="https://disanthainguyen.pages.dev/" target="_blank">Website chính</a></li>
+    <li>🔍 <a href="/health/deep" target="_blank">Kiểm tra sâu hệ thống AI</a></li>
+  </ul>
+
+  <div class="footer">
+    © 2026 A1K64 THPT Phú Bình · Sản phẩm dự thi Cuộc thi KHKT cấp tỉnh
+  </div>
+</div>
+</body>
+</html>`;
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(html);
+});
 app.use((req, res) => {
     res.status(404).json({ error: 'Not found', path: req.path });
 });
