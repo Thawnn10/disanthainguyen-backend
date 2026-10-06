@@ -6,16 +6,44 @@ const { GoogleGenAI } = require('@google/genai');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+/* ------------------------------------------------------------
+ * CORS — cho phép mọi origin (có thể siết lại nếu cần)
+ * ---------------------------------------------------------- */
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type']
+}));
+app.use(express.json({ limit: '256kb' }));
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+/* ------------------------------------------------------------
+ * KIỂM TRA API KEY LÚC KHỞI ĐỘNG
+ * ---------------------------------------------------------- */
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+if (!GEMINI_API_KEY || !GEMINI_API_KEY.trim()) {
+    console.error('❌ [FATAL] Thiếu biến môi trường GEMINI_API_KEY.');
+    console.error('   → Vào Render Dashboard > Service > Environment > thêm GEMINI_API_KEY.');
+    console.error('   → Lấy key tại: https://aistudio.google.com/app/apikey');
+} else {
+    console.log('✅ [ENV] GEMINI_API_KEY đã được nạp (độ dài:', GEMINI_API_KEY.length, 'ký tự).');
+}
 
-/**
- * SYSTEM INSTRUCTION
- */
+let ai = null;
+try {
+    if (GEMINI_API_KEY) {
+        ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+    }
+} catch (e) {
+    console.error('❌ Không khởi tạo được GoogleGenAI:', e.message);
+}
+
+/* ------------------------------------------------------------
+ * MODEL & SYSTEM INSTRUCTION
+ * ---------------------------------------------------------- */
+const MODEL_NAME = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+
 const SYSTEM_INSTRUCTION = `
-Bạn là Trợ Lý AI Di Sản & Tri Thức Thông Minh. Nhiệm vụ của bạn là giải đáp chính xác, đầy đủ các câu hỏi về di sản, lịch sử, văn hóa (đặc biệt là Thái Nguyên và Việt Nam) cũng như các lĩnh vực tri thức khác.
+Bạn là Trợ Lý AI Di Sản & Tri Thức Thông Minh — sản phẩm của dự án Khoa học Kỹ thuật "Di Sản Thái Nguyên · Âm Vang Di Sản" (A1K64 THPT Phú Bình). Nhiệm vụ của bạn là giải đáp chính xác, đầy đủ các câu hỏi về di sản, lịch sử, văn hóa (đặc biệt là Thái Nguyên và Việt Nam) cũng như các lĩnh vực tri thức khác.
 
 ==============================
 XỬ LÝ THÔNG TIN & ĐỊA DANH
@@ -34,184 +62,275 @@ PHONG CÁCH TRẢ LỜI
 ==============================
 - Ngắn gọn, rõ ràng, sử dụng gạch đầu dòng (bullet points) để người dùng dễ theo dõi.
 - Đi thẳng vào vấn đề, không chào hỏi dài dòng.
-- KHÔNG tự thêm phần "Nguồn tham khảo" ở cuối — hệ thống sẽ tự đính kèm.
-`;
+`.trim();
 
-/* ============================================================
- *  HẬU XỬ LÝ (POST-PROCESSING) — GỌT DŨA DỮ LIỆU TRƯỚC KHI TRẢ VỀ
- * ============================================================ */
-
-/**
- * Chuẩn hóa text trả về từ AI:
- *  - Bỏ khối "Nguồn tham khảo" nếu AI tự sinh (tránh trùng lặp)
- *  - Bỏ citation dạng [1], [2]… hoặc [source](url) lẫn trong câu
- *  - Chuẩn hóa bullet (-, *, •) về "- "
- *  - Gộp dòng trống liên tiếp, trim đầu/cuối
- *  - Sửa khoảng trắng thừa trước dấu câu
- */
-function polishReply(raw) {
-    if (!raw || typeof raw !== 'string') return '';
-
-    let text = raw;
-
-    // 1) Bỏ phần "Nguồn tham khảo" do AI tự thêm (nếu có)
-    text = text.replace(
-        /\n*\*{0,2}\s*Nguồn tham khảo\s*:?\s*\*{0,2}[\s\S]*$/i,
-        ''
-    );
-
-    // 2) Bỏ citation dạng [1], [2], [1][2]...
-    text = text.replace(/\[\d+\]/g, '');
-
-    // 3) Bỏ link markdown dạng [title](url) nằm rời rạc trong câu trả lời
-    //    (nhưng vẫn giữ lại text title)
-    text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '$1');
-
-    // 4) Chuẩn hóa bullet: *, •, + ở đầu dòng -> "- "
-    text = text.replace(/^[\s]*[*•+]\s+/gm, '- ');
-
-    // 5) Chuẩn hóa heading markdown: ### -> ### (giữ), nhưng bỏ dấu # lạc
-    text = text.replace(/^#{4,}\s*/gm, '### ');
-
-    // 6) Sửa khoảng trắng trước dấu câu
-    text = text.replace(/\s+([,.;:!?])/g, '$1');
-
-    // 7) Gộp nhiều dòng trống liên tiếp thành 1 dòng trống
-    text = text.replace(/\n{3,}/g, '\n\n');
-
-    // 8) Trim từng dòng (bỏ khoảng trắng thừa cuối dòng)
-    text = text
-        .split('\n')
-        .map((line) => line.replace(/[ \t]+$/g, ''))
-        .join('\n');
-
-    // 9) Trim toàn bộ
-    return text.trim();
-}
-
-/**
- * Trích xuất + làm sạch danh sách nguồn từ Google Search Grounding
- *  - Loại bỏ nguồn trùng URL
- *  - Chuẩn hóa title (bỏ prefix site, trim, cắt độ dài)
- *  - Ưu tiên domain uy tín (gov.vn, edu.vn, wikipedia...)
- */
+/* ------------------------------------------------------------
+ * TRÍCH XUẤT NGUỒN TỪ GOOGLE SEARCH GROUNDING
+ * ---------------------------------------------------------- */
 function extractGroundingSources(candidate) {
     const chunks = candidate?.groundingMetadata?.groundingChunks || [];
-
-    const TRUSTED = [
-        '.gov.vn', '.edu.vn', 'wikipedia.org', 'baothainguyen.vn',
-        'dangcongsan.vn', 'nhandan.vn', 'vov.vn', 'vnexpress.net'
-    ];
-
-    const seen = new Map();
-
+    const sources = [];
     chunks.forEach((chunk) => {
-        const web = chunk?.web;
-        if (!web?.uri || !web?.title) return;
-
-        const url = web.uri.trim();
-        const key = url.replace(/\/+$/, '').toLowerCase();
-        if (seen.has(key)) return;
-
-        // Làm sạch title
-        let title = web.title
-            .replace(/\s+/g, ' ')
-            .replace(/^[\-–—|:]\s*/, '')
-            .trim();
-        if (title.length > 120) title = title.slice(0, 117) + '...';
-
-        let host = '';
-        try {
-            host = new URL(url).hostname.toLowerCase();
-        } catch (_) { /* ignore */ }
-
-        const trusted = TRUSTED.some((d) => host.endsWith(d));
-
-        seen.set(key, { title, url, host, trusted });
+        if (chunk.web?.uri && chunk.web?.title) {
+            sources.push({ title: chunk.web.title, url: chunk.web.uri });
+        }
     });
-
-    const list = Array.from(seen.values());
-
-    // Ưu tiên nguồn uy tín lên trước, sau đó tới thứ tự xuất hiện
-    list.sort((a, b) => Number(b.trusted) - Number(a.trusted));
-
-    return list.map(({ title, url }) => ({ title, url }));
+    return Array.from(new Map(sources.map(s => [s.url, s])).values());
 }
 
-/**
- * Định dạng khối "Nguồn tham khảo" sạch sẽ
- */
-function formatSourcesBlock(sources, limit = 3) {
-    if (!sources.length) return '';
-    const lines = sources
-        .slice(0, limit)
-        .map((s, i) => `${i + 1}. [${s.title}](${s.url})`)
-        .join('\n');
-    return `\n\n---\n**Nguồn tham khảo:**\n${lines}`;
+/* ------------------------------------------------------------
+ * LẤY TEXT TỪ RESPONSE (hỗ trợ cả .text property và .text() method)
+ * ---------------------------------------------------------- */
+function getResponseText(response) {
+    if (!response) return '';
+    try {
+        if (typeof response.text === 'string') return response.text;
+        if (typeof response.text === 'function') return response.text();
+    } catch (e) { /* ignore */ }
+    // Fallback: đọc từ candidates
+    try {
+        const parts = response.candidates?.[0]?.content?.parts || [];
+        return parts.map(p => p?.text || '').join('');
+    } catch (e) {
+        return '';
+    }
 }
 
-/* ============================================================
- *  API ROUTES
- * ============================================================ */
+/* ------------------------------------------------------------
+ * WRAPPER: GỌI GEMINI VỚI TIMEOUT
+ * ---------------------------------------------------------- */
+function withTimeout(promise, ms, label) {
+    let t;
+    const timeout = new Promise((_, reject) => {
+        t = setTimeout(() => reject(new Error(`${label} timeout sau ${ms}ms`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+}
 
-app.post('/api/chat', async (req, res) => {
-    const { message, history } = req.body || {};
-
-    if (!message || typeof message !== 'string' || !message.trim()) {
-        return res.status(400).json({ error: 'Message is required' });
+/* ------------------------------------------------------------
+ * GỌI GEMINI — thử với Google Search, fallback nếu lỗi
+ * ---------------------------------------------------------- */
+async function callGemini(message, { useSearch = true } = {}) {
+    if (!ai) {
+        throw new Error('GoogleGenAI chưa được khởi tạo (thiếu GEMINI_API_KEY).');
     }
 
+    const config = {
+        systemInstruction: SYSTEM_INSTRUCTION,
+        temperature: 0.3,
+        maxOutputTokens: 1200
+    };
+    if (useSearch) {
+        config.tools = [{ googleSearch: {} }];
+    }
+
+    return await withTimeout(
+        ai.models.generateContent({
+            model: MODEL_NAME,
+            contents: message,
+            config
+        }),
+        45000,
+        'Gemini'
+    );
+}
+
+/* ------------------------------------------------------------
+ * ENDPOINT CHÍNH: /api/chat
+ * ---------------------------------------------------------- */
+app.post('/api/chat', async (req, res) => {
+    const startedAt = Date.now();
+    const { message } = req.body || {};
+
+    if (!message || typeof message !== 'string' || !message.trim()) {
+        return res.status(400).json({
+            error: 'Message is required',
+            detail: 'Trường "message" không được để trống.'
+        });
+    }
+    if (message.length > 4000) {
+        return res.status(400).json({
+            error: 'Message too long',
+            detail: 'Câu hỏi quá dài (giới hạn 4000 ký tự).'
+        });
+    }
+
+    if (!ai) {
+        console.error('[AI ERROR] GoogleGenAI chưa được khởi tạo.');
+        return res.status(503).json({
+            error: 'AI chưa được cấu hình. Vui lòng kiểm tra GEMINI_API_KEY trên server.',
+            detail: 'GEMINI_API_KEY is missing on server.'
+        });
+    }
+
+    let response = null;
+    let usedSearch = true;
+    let lastErr = null;
+
+    /* Lần 1: có Google Search */
     try {
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: message.trim(),
-            config: {
-                systemInstruction: SYSTEM_INSTRUCTION,
-                temperature: 0.3,
-                maxOutputTokens: 1000,
-                tools: [{ googleSearch: {} }],
-            },
+        response = await callGemini(message, { useSearch: true });
+    } catch (err) {
+        lastErr = err;
+        console.error('[AI ERROR · with search]', {
+            name: err?.name,
+            message: err?.message,
+            status: err?.status,
+            code: err?.code,
+            details: err?.errorDetails || err?.details
         });
 
-        const candidate = response.candidates?.[0];
+        /* Lần 2: fallback — không search */
+        try {
+            console.log('[AI] Thử lại KHÔNG có Google Search...');
+            response = await callGemini(message, { useSearch: false });
+            usedSearch = false;
+        } catch (err2) {
+            lastErr = err2;
+            console.error('[AI ERROR · without search]', {
+                name: err2?.name,
+                message: err2?.message,
+                status: err2?.status,
+                code: err2?.code
+            });
+        }
+    }
 
-        // B1: Lấy text thô
-        const rawReply = response.text || '';
+    if (!response) {
+        const msg = lastErr?.message || 'Unknown error';
+        let hint = 'Vui lòng thử lại sau ít phút.';
 
-        // B2: Gọt dũa text
-        let reply = polishReply(rawReply);
+        if (/API key|api_key|API_KEY|permission|PERMISSION_DENIED|403/i.test(msg)) {
+            hint = 'API key không hợp lệ hoặc chưa được bật quyền. Kiểm tra GEMINI_API_KEY trên Render.';
+        } else if (/quota|rate|429|RESOURCE_EXHAUSTED/i.test(msg)) {
+            hint = 'Đã vượt quota/giới hạn tốc độ của Gemini. Vui lòng chờ vài phút rồi thử lại.';
+        } else if (/not found|404|model/i.test(msg)) {
+            hint = `Model "${MODEL_NAME}" không khả dụng với API key này. Thử đổi biến môi trường GEMINI_MODEL=gemini-2.0-flash.`;
+        } else if (/timeout/i.test(msg)) {
+            hint = 'Gemini phản hồi quá chậm. Thử lại với câu hỏi ngắn hơn.';
+        }
 
-        // B3: Trích xuất & làm sạch nguồn
-        const sources = extractGroundingSources(candidate);
+        return res.status(500).json({
+            error: 'Đã xảy ra lỗi khi kết nối với AI. ' + hint,
+            detail: msg,
+            model: MODEL_NAME,
+            hasApiKey: !!GEMINI_API_KEY,
+            elapsedMs: Date.now() - startedAt
+        });
+    }
 
-        // B4: Gắn khối nguồn đã chuẩn hóa
-        reply += formatSourcesBlock(sources, 3);
+    const candidate = response.candidates?.[0];
+    let reply = getResponseText(response) || '';
 
-        // B5: Fallback nếu AI không trả về nội dung
-        if (!reply.trim()) {
-            reply = 'Xin lỗi, hiện tại tôi chưa có câu trả lời phù hợp. Bạn vui lòng thử lại hoặc diễn đạt câu hỏi rõ hơn.';
+    if (!reply || !reply.trim()) {
+        return res.status(502).json({
+            error: 'AI trả về nội dung rỗng. Vui lòng thử lại.',
+            detail: 'Empty response from Gemini.',
+            finishReason: candidate?.finishReason || null,
+            elapsedMs: Date.now() - startedAt
+        });
+    }
+
+    const sources = usedSearch ? extractGroundingSources(candidate) : [];
+
+    if (sources.length > 0) {
+        const sourceText = sources
+            .slice(0, 3)
+            .map(s => `- [${s.title}](${s.url})`)
+            .join('\n');
+        reply += `\n\n**Nguồn tham khảo:**\n${sourceText}`;
+    }
+
+    console.log(`[OK] ${Date.now() - startedAt}ms · search=${usedSearch} · sources=${sources.length} · len=${reply.length}`);
+
+    res.json({
+        reply,
+        sources,
+        usedSearch,
+        elapsedMs: Date.now() - startedAt
+    });
+});
+
+/* ------------------------------------------------------------
+ * HEALTH CHECK — cơ bản
+ * ---------------------------------------------------------- */
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        project: 'Heritage AI Assistant',
+        model: MODEL_NAME,
+        hasApiKey: !!GEMINI_API_KEY,
+        uptimeSec: Math.round(process.uptime())
+    });
+});
+
+/* ------------------------------------------------------------
+ * DEEP HEALTH — gọi thử Gemini để xác minh API key
+ * GET /health?deep=1
+ * ---------------------------------------------------------- */
+app.get('/health/deep', async (req, res) => {
+    const startedAt = Date.now();
+    if (!ai) {
+        return res.status(503).json({
+            ok: false,
+            stage: 'init',
+            error: 'GoogleGenAI chưa được khởi tạo (thiếu GEMINI_API_KEY).'
+        });
+    }
+
+    // 1. Test không search
+    try {
+        const r1 = await callGemini('Trả lời đúng 1 từ: "OK"', { useSearch: false });
+        const t1 = getResponseText(r1);
+        // 2. Test có search
+        let searchOk = false;
+        let searchErr = null;
+        try {
+            const r2 = await callGemini('Hôm nay là ngày gì?', { useSearch: true });
+            searchOk = !!getResponseText(r2);
+        } catch (e) {
+            searchErr = e?.message || String(e);
         }
 
         return res.json({
-            reply,
-            sources,
-            meta: {
-                model: 'gemini-2.5-flash',
-                hasGrounding: sources.length > 0,
-            },
+            ok: true,
+            model: MODEL_NAME,
+            noSearchOK: true,
+            sampleText: t1.slice(0, 80),
+            googleSearchOK: searchOk,
+            googleSearchError: searchErr,
+            elapsedMs: Date.now() - startedAt
         });
     } catch (err) {
-        console.error('[AI ERROR]', err);
         return res.status(500).json({
-            error: 'Đã xảy ra lỗi khi kết nối với AI. Vui lòng thử lại sau.',
+            ok: false,
+            stage: 'generateContent',
+            model: MODEL_NAME,
+            error: err?.message || String(err),
+            status: err?.status || null,
+            code: err?.code || null,
+            elapsedMs: Date.now() - startedAt
         });
     }
 });
 
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok', project: 'Heritage AI Assistant' });
+/* ------------------------------------------------------------
+ * 404 + ERROR HANDLER
+ * ---------------------------------------------------------- */
+app.use((req, res) => {
+    res.status(404).json({ error: 'Not found', path: req.path });
 });
 
+app.use((err, req, res, next) => {
+    console.error('[UNHANDLED]', err);
+    res.status(500).json({ error: 'Internal server error', detail: err?.message });
+});
+
+/* ------------------------------------------------------------
+ * START
+ * ---------------------------------------------------------- */
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`🚀 Server running on port ${PORT} | model=${MODEL_NAME}`);
+    console.log(`   Test API key:  GET  http://localhost:${PORT}/health/deep`);
+    console.log(`   Chat:          POST http://localhost:${PORT}/api/chat`);
 });
