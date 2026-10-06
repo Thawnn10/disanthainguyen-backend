@@ -12,12 +12,19 @@ app.use(express.json({ limit: '256kb' }));
 /* ---------- ENV CHECK ---------- */
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// ⭐ ĐÃ CẬP NHẬT: Sử dụng model mới nhất thay thế gemini-2.0-flash đã bị khai tử
-const MODEL_NAME = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+// Model chính
+const PRIMARY_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+
+// Danh sách model fallback theo thứ tự ưu tiên (nếu model chính quá tải)
+const FALLBACK_MODELS = (
+    process.env.GEMINI_FALLBACK_MODELS ||
+    'gemini-3.7-flash,gemini-3.5-flash,gemini-2.5-flash'
+).split(',').map(s => s.trim()).filter(Boolean);
 
 console.log('========================================');
 console.log('[BOOT] Port:', PORT);
-console.log('[BOOT] Model:', MODEL_NAME);
+console.log('[BOOT] Primary model:', PRIMARY_MODEL);
+console.log('[BOOT] Fallback models:', FALLBACK_MODELS.join(' → '));
 console.log('[BOOT] GEMINI_API_KEY:', GEMINI_API_KEY
     ? `✅ Có (${GEMINI_API_KEY.slice(0,10)}...${GEMINI_API_KEY.slice(-4)})`
     : '❌ THIẾU');
@@ -62,6 +69,87 @@ function getResponseText(response) {
     } catch (e) { return ''; }
 }
 
+/* ---------- HELPER: kiểm tra lỗi có thể retry ---------- */
+function isRetryableError(err) {
+    const msg = (err?.message || String(err)).toLowerCase();
+    const status = err?.status || err?.code;
+
+    // 503 UNAVAILABLE, 429 RESOURCE_EXHAUSTED, 500 INTERNAL, 502, 504, timeout
+    if (status === 503 || status === 429 || status === 500 || status === 502 || status === 504) return true;
+    if (/unavailable|overloaded|high demand|resource_exhausted|rate limit|timeout|deadline|try again later/i.test(msg)) return true;
+    return false;
+}
+
+/* ---------- HELPER: exponential backoff delay với jitter ---------- */
+function backoffDelay(attempt) {
+    // 1s, 2s, 4s, 8s + jitter 0-500ms
+    const base = Math.min(1000 * Math.pow(2, attempt), 8000);
+    const jitter = Math.floor(Math.random() * 500);
+    return base + jitter;
+}
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/* ---------- GỌI GEMINI VỚI RETRY + FALLBACK MODEL ---------- */
+async function callGeminiWithRetry(message, maxRetriesPerModel = 3) {
+    const modelsToTry = [PRIMARY_MODEL, ...FALLBACK_MODELS];
+    const errors = [];
+
+    for (const modelName of modelsToTry) {
+        for (let attempt = 0; attempt < maxRetriesPerModel; attempt++) {
+            try {
+                console.log(`[GEMINI] Thử model="${modelName}" attempt=${attempt + 1}/${maxRetriesPerModel}`);
+
+                const response = await ai.models.generateContent({
+                    model: modelName,
+                    contents: message,
+                    config: {
+                        systemInstruction: SYSTEM_INSTRUCTION,
+                        temperature: 0.3,
+                        maxOutputTokens: 1200
+                    }
+                });
+
+                console.log(`[GEMINI] ✅ Thành công với model="${modelName}" attempt=${attempt + 1}`);
+                return { response, modelUsed: modelName };
+
+            } catch (err) {
+                const msg = err?.message || String(err);
+                const status = err?.status || err?.code;
+
+                console.error(`[GEMINI] ❌ model="${modelName}" attempt=${attempt + 1} status=${status} msg=${msg}`);
+
+                errors.push({ model: modelName, attempt: attempt + 1, status, message: msg });
+
+                if (!isRetryableError(err)) {
+                    // Lỗi không thể retry (API key sai, model không tồn tại...) → nhảy sang model tiếp theo
+                    console.log(`[GEMINI] ⏭️ Lỗi không thể retry, bỏ qua model="${modelName}"`);
+                    break;
+                }
+
+                // Nếu còn lượt retry cho model này → chờ rồi thử lại
+                if (attempt < maxRetriesPerModel - 1) {
+                    const delay = backoffDelay(attempt);
+                    console.log(`[GEMINI] ⏳ Chờ ${delay}ms trước khi retry...`);
+                    await sleep(delay);
+                }
+            }
+        }
+        console.log(`[GEMINI] 🔄 Chuyển sang model fallback tiếp theo...`);
+    }
+
+    // Tất cả model đều thất bại
+    const lastError = errors[errors.length - 1];
+    const error = new Error(
+        `Tất cả model đều thất bại sau nhiều lần thử. Lỗi cuối: [${lastError?.model}] ${lastError?.message}`
+    );
+    error.errors = errors;
+    error.status = lastError?.status || 503;
+    throw error;
+}
+
 /* ---------- ROUTE: /api/chat ---------- */
 app.post('/api/chat', async (req, res) => {
     const t0 = Date.now();
@@ -95,64 +183,54 @@ app.post('/api/chat', async (req, res) => {
         });
     }
 
-    let response;
+    let result;
     try {
-        console.log('[CHAT] Gọi Gemini (KHÔNG search)...');
-        response = await ai.models.generateContent({
-            model: MODEL_NAME,
-            contents: message,
-            config: {
-                systemInstruction: SYSTEM_INSTRUCTION,
-                temperature: 0.3,
-                maxOutputTokens: 1200
-            }
-        });
-        console.log('[CHAT] ✅ Gemini trả về sau', Date.now() - t0, 'ms');
+        result = await callGeminiWithRetry(message);
     } catch (err) {
-        const msg = err?.message || String(err);
-        console.error('[CHAT] ❌ GEMINI ERROR:', msg);
-        console.error('[CHAT]    name:', err?.name);
-        console.error('[CHAT]    status:', err?.status);
-        console.error('[CHAT]    code:', err?.code);
+        console.error('[CHAT] ❌ TẤT CẢ MODEL ĐỀU THẤT BẠI');
+        console.error('[CHAT] errors:', JSON.stringify(err.errors, null, 2));
 
-        let hint = 'Vui lòng thử lại sau.';
-        if (/API key|api_key|API_KEY|permission|PERMISSION_DENIED|403|UNAUTHENTICATED/i.test(msg)) {
-            hint = 'API key không hợp lệ hoặc chưa bật quyền Gemini API. Kiểm tra GEMINI_API_KEY và bật tại https://aistudio.google.com/app/apikey';
-        } else if (/quota|rate|429|RESOURCE_EXHAUSTED/i.test(msg)) {
-            hint = 'Đã vượt quota/giới hạn tốc độ. Chờ vài phút rồi thử lại.';
+        let hint = 'Vui lòng thử lại sau ít phút.';
+        const msg = err.message || '';
+
+        if (/api key|permission|unauthorized|403|401/i.test(msg)) {
+            hint = 'API key không hợp lệ. Kiểm tra GEMINI_API_KEY tại https://aistudio.google.com/app/apikey';
+        } else if (/quota|rate limit|resource_exhausted|429/i.test(msg)) {
+            hint = 'Đã vượt quota. Chờ 1-2 phút rồi thử lại.';
+        } else if (/unavailable|overloaded|high demand|503/i.test(msg)) {
+            hint = 'Google đang quá tải tạm thời. Hệ thống đã thử lại nhiều lần nhưng chưa thành công. Vui lòng thử lại sau 30-60 giây.';
         } else if (/not found|404|model/i.test(msg)) {
-            hint = `Model "${MODEL_NAME}" không khả dụng. Thử đổi biến môi trường GEMINI_MODEL=gemini-3.8-flash.`;
-        } else if (/timeout|DEADLINE/i.test(msg)) {
-            hint = 'Gemini phản hồi quá chậm.';
+            hint = 'Model không khả dụng. Thử đổi biến môi trường GEMINI_MODEL=gemini-2.5-flash.';
         }
 
-        return res.status(500).json({
-            error: 'Lỗi gọi Gemini: ' + hint,
-            detail: msg,
-            model: MODEL_NAME,
-            hasApiKey: !!GEMINI_API_KEY,
+        return res.status(503).json({
+            error: hint,
+            detail: err.message,
+            attempts: err.errors,
             elapsedMs: Date.now() - t0
         });
     }
 
-    const reply = getResponseText(response);
+    const reply = getResponseText(result.response);
 
     if (!reply || !reply.trim()) {
         console.error('[CHAT] ❌ Gemini trả về rỗng');
         return res.status(502).json({
             error: 'Gemini trả về nội dung rỗng. Vui lòng thử lại.',
             detail: 'Empty response text',
-            finishReason: response?.candidates?.[0]?.finishReason || null,
+            modelUsed: result.modelUsed,
+            finishReason: result.response?.candidates?.[0]?.finishReason || null,
             elapsedMs: Date.now() - t0
         });
     }
 
-    console.log('[CHAT] ✅ OK · len=' + reply.length + ' · ' + (Date.now() - t0) + 'ms');
+    console.log('[CHAT] ✅ OK · model=' + result.modelUsed + ' · len=' + reply.length + ' · ' + (Date.now() - t0) + 'ms');
 
     res.json({
         reply,
         sources: [],
         usedSearch: false,
+        modelUsed: result.modelUsed,
         elapsedMs: Date.now() - t0
     });
 });
@@ -162,7 +240,8 @@ app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
         project: 'Heritage AI Assistant',
-        model: MODEL_NAME,
+        primaryModel: PRIMARY_MODEL,
+        fallbackModels: FALLBACK_MODELS,
         hasApiKey: !!GEMINI_API_KEY,
         aiReady: !!ai,
         uptimeSec: Math.round(process.uptime())
@@ -180,24 +259,21 @@ app.get('/health/deep', async (req, res) => {
         });
     }
     try {
-        const r = await ai.models.generateContent({
-            model: MODEL_NAME,
-            contents: 'Nói đúng một từ: OK'
-        });
-        const text = getResponseText(r);
+        const result = await callGeminiWithRetry('Nói đúng một từ: OK', 2);
+        const text = getResponseText(result.response);
         return res.json({
             ok: true,
-            model: MODEL_NAME,
+            modelUsed: result.modelUsed,
+            primaryModel: PRIMARY_MODEL,
             sampleText: text.slice(0, 100),
             elapsedMs: Date.now() - t0
         });
     } catch (err) {
-        return res.status(500).json({
+        return res.status(503).json({
             ok: false,
-            model: MODEL_NAME,
+            primaryModel: PRIMARY_MODEL,
             error: err?.message || String(err),
-            status: err?.status || null,
-            code: err?.code || null,
+            attempts: err.errors,
             elapsedMs: Date.now() - t0
         });
     }
@@ -213,7 +289,8 @@ app.get('/', (req, res) => {
             health: 'GET /health',
             healthDeep: 'GET /health/deep'
         },
-        model: MODEL_NAME,
+        primaryModel: PRIMARY_MODEL,
+        fallbackModels: FALLBACK_MODELS,
         hasApiKey: !!GEMINI_API_KEY,
         aiReady: !!ai
     });
