@@ -19,12 +19,6 @@ console.log('[BOOT] Model:', MODEL_NAME);
 console.log('[BOOT] GEMINI_API_KEY:', GEMINI_API_KEY
     ? `✅ Có (${GEMINI_API_KEY.slice(0,10)}...${GEMINI_API_KEY.slice(-4)})`
     : '❌ THIẾU');
-try {
-    const v = require('@google/genai/package.json').version;
-    console.log('[BOOT] @google/genai version:', v);
-} catch (e) {
-    console.log('[BOOT] Không đọc được version @google/genai');
-}
 console.log('========================================');
 
 let ai = null;
@@ -58,8 +52,8 @@ PHONG CÁCH:
 function getResponseText(response) {
     if (!response) return '';
     try {
+        // SDK mới: response.text là một PROPERTY, không phải function
         if (typeof response.text === 'string') return response.text;
-        if (typeof response.text === 'function') return response.text();
     } catch (e) { }
     try {
         const parts = response.candidates?.[0]?.content?.parts || [];
@@ -121,7 +115,6 @@ app.post('/api/chat', async (req, res) => {
         console.error('[CHAT]    name:', err?.name);
         console.error('[CHAT]    status:', err?.status);
         console.error('[CHAT]    code:', err?.code);
-        console.error('[CHAT]    stack:', err?.stack);
 
         let hint = 'Vui lòng thử lại sau.';
         if (/API key|api_key|API_KEY|permission|PERMISSION_DENIED|403|UNAUTHENTICATED/i.test(msg)) {
@@ -132,8 +125,6 @@ app.post('/api/chat', async (req, res) => {
             hint = `Model "${MODEL_NAME}" không khả dụng với key này. Thử đổi biến môi trường GEMINI_MODEL=gemini-2.0-flash hoặc gemini-1.5-flash.`;
         } else if (/timeout|DEADLINE/i.test(msg)) {
             hint = 'Gemini phản hồi quá chậm.';
-        } else if (/fetch|network|ENOTFOUND|ECONNREFUSED/i.test(msg)) {
-            hint = 'Lỗi mạng từ server tới Gemini.';
         }
 
         return res.status(500).json({
