@@ -1,18 +1,17 @@
 {
   "name": "disan-thainguyen-backend",
-  "version": "1.0.0",
-  "description": "Backend API Chatbot AI cho dự án Di sản Thái Nguyên",
-  "main": "server.js",
+  "version": "2.0.0",
+  "description": "Backend API Chatbot AI cho dự án Di sản Thái Nguyên (Cloudflare Edge)",
+  "main": "src/index.js",
   "scripts": {
-    "start": "node server.js"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "@google/genai": "latest",
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "@google/genai": "^0.1.1",
+    "hono": "^4.2.0"
   },
-  "engines": {
-    "node": ">=18.0.0"
+  "devDependencies": {
+    "wrangler": "^3.0.0"
   }
 }
