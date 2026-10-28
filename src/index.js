@@ -7,7 +7,7 @@ const app = new Hono();
 // Middleware: Kích hoạt CORS cho mọi request
 app.use('/*', cors({ origin: '*' }));
 
-/* ---------- SYSTEM INSTRUCTION ---------- */
+/* ---------- SYSTEM INSTRUCTION (GIỮ NGUYÊN 100% TOÀN BỘ NỘI DUNG) ---------- */
 const SYSTEM_INSTRUCTION = `
 # SYSTEM PROMPT
 
@@ -544,10 +544,9 @@ Trước khi trả lời một câu hỏi quan trọng về di sản văn hóa p
 Nếu chưa đáp ứng được những yêu cầu cần thiết, hãy tra cứu thêm hoặc nói rõ giới hạn xác minh.
 
 **Sứ mệnh cuối cùng: Trở thành một trợ lý AI nghiên cứu di sản văn hóa đáng tin cậy, góp phần bảo tồn, lan tỏa và phát huy những giá trị văn hóa đặc sắc của Thái Nguyên và Việt Nam trên nền tảng thông tin chính xác, có nguồn gốc rõ ràng và tôn trọng sự thật lịch sử.**
-
 `.trim();
 
-/* ---------- HELPER: exponential backoff ---------- */
+/* ---------- HELPER FUNCTIONS ---------- */
 function backoffDelay(attempt) {
     return Math.min(1000 * Math.pow(2, attempt), 8000) + Math.floor(Math.random() * 500);
 }
@@ -556,52 +555,74 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-/* ---------- LOGIC: GỌI GEMINI VỚI SEARCH & RETRY ---------- */
-async function callGeminiWithRetry(message, env, maxRetriesPerModel = 3) {
-    const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
-    
-    const primaryModel = env.GEMINI_MODEL || 'gemini-2.0-flash';
-    const fallbackString = env.GEMINI_FALLBACK_MODELS || 'gemini-1.5-flash';
+/* ---------- LOGIC: GỌI GEMINI XOAY VÒNG KEY & MODEL RETRY ---------- */
+async function callGeminiWithRetry(message, env) {
+    // 1. Lấy danh sách API Key (hỗ trợ cả GEMINI_KEYS phân tách bằng dấu phẩy hoặc GEMINI_API_KEY đơn lẻ)
+    const rawKeys = env.GEMINI_KEYS || env.GEMINI_API_KEY || '';
+    const keys = rawKeys.split(',').map(k => k.trim()).filter(Boolean);
+
+    if (keys.length === 0) {
+        throw new Error('Chưa cấu hình GEMINI_KEYS hoặc GEMINI_API_KEY');
+    }
+
+    const primaryModel = env.GEMINI_MODEL || 'gemini-2.5-flash';
+    const fallbackString = env.GEMINI_FALLBACK_MODELS || 'gemini-2.0-flash,gemini-1.5-flash';
     const fallbackModels = fallbackString.split(',').map(s => s.trim()).filter(Boolean);
-    
-    const modelsToTry = [primaryModel, ...fallbackModels];
+    const modelsToTry = [...new Set([primaryModel, ...fallbackModels])];
+
     let errors = [];
 
-    for (const modelName of modelsToTry) {
-        for (let attempt = 0; attempt < maxRetriesPerModel; attempt++) {
-            try {
-                // ĐÂY LÀ ĐIỂM CHÍNH: KÍCH HOẠT SIÊU AI TRA CỨU
-                const response = await ai.models.generateContent({
-                    model: modelName,
-                    contents: [{ role: 'user', parts: [{ text: message }] }],
-                    config: {
-                        systemInstruction: SYSTEM_INSTRUCTION,
-                        temperature: 0.3,
-                        maxOutputTokens: 2000,
-                        // Bật tính năng tra cứu Google chuẩn xác
-                        tools: [{ googleSearch: {} }] 
+    // 2. Vòng lặp duyệt qua từng API Key
+    for (let keyIdx = 0; keyIdx < keys.length; keyIdx++) {
+        const apiKey = keys[keyIdx];
+        const ai = new GoogleGenAI({ apiKey });
+
+        // Duyệt qua danh sách Model dự phòng
+        for (const modelName of modelsToTry) {
+            for (let attempt = 0; attempt < 2; attempt++) {
+                try {
+                    const response = await ai.models.generateContent({
+                        model: modelName,
+                        contents: [{ role: 'user', parts: [{ text: message }] }],
+                        config: {
+                            systemInstruction: SYSTEM_INSTRUCTION,
+                            temperature: 0.3,
+                            maxOutputTokens: 2000,
+                            tools: [{ googleSearch: {} }] // Kích hoạt Google Search Grounding
+                        }
+                    });
+
+                    if (!response.text) throw new Error('Model trả về rỗng');
+
+                    const searchChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+                    const sources = searchChunks.map(chunk => chunk.web?.uri).filter(Boolean);
+
+                    return {
+                        reply: response.text,
+                        modelUsed: modelName,
+                        keyIndexUsed: keyIdx + 1,
+                        sources: [...new Set(sources)]
+                    };
+                } catch (err) {
+                    const msg = err?.message || String(err);
+                    const isRateLimit = /429|quota|rate limit|resource_exhausted/i.test(msg);
+
+                    errors.push({ keyIndex: keyIdx + 1, model: modelName, attempt: attempt + 1, message: msg });
+
+                    // Nếu dính lỗi Rate Limit (429) -> Ngắt ngay lập tức để nhảy sang API Key tiếp theo
+                    if (isRateLimit) {
+                        console.warn(`[Key ${keyIdx + 1}] Chạm giới hạn 429. Đổi ngay sang Key tiếp theo...`);
+                        break;
                     }
-                });
 
-                if (!response.text) throw new Error('Model trả về rỗng');
-                
-                // Trích xuất nguồn (nếu có tra cứu)
-                const searchChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-                const sources = searchChunks.map(chunk => chunk.web?.uri).filter(Boolean);
-
-                return { 
-                    reply: response.text, 
-                    modelUsed: modelName,
-                    sources: [...new Set(sources)] // Lọc trùng lặp
-                };
-            } catch (err) {
-                errors.push({ model: modelName, attempt: attempt + 1, message: err.message });
-                const delay = backoffDelay(attempt);
-                await sleep(delay);
+                    const delay = backoffDelay(attempt);
+                    await sleep(delay);
+                }
             }
         }
     }
-    throw new Error('Tất cả model đều thất bại. ' + JSON.stringify(errors));
+
+    throw new Error('Tất cả API Key và Model dự phòng đều bị quá tải. Chi tiết: ' + JSON.stringify(errors));
 }
 
 /* ---------- ROUTE: /api/chat ---------- */
@@ -609,15 +630,15 @@ app.post('/api/chat', async (c) => {
     const t0 = Date.now();
     const env = c.env;
 
-    if (!env.GEMINI_API_KEY) {
-        return c.json({ error: 'Thiếu GEMINI_API_KEY trên Cloudflare' }, 503);
+    if (!env.GEMINI_KEYS && !env.GEMINI_API_KEY) {
+        return c.json({ error: 'Thiếu GEMINI_KEYS hoặc GEMINI_API_KEY trên Cloudflare' }, 503);
     }
 
     try {
         const body = await c.req.json();
         const message = body.message;
 
-        if (!message || typeof message !== 'string') {
+        if (!message || typeof message !== 'string' || !message.trim()) {
             return c.json({ error: 'Câu hỏi không hợp lệ' }, 400);
         }
 
@@ -628,30 +649,33 @@ app.post('/api/chat', async (c) => {
             sources: result.sources,
             usedSearch: result.sources.length > 0,
             modelUsed: result.modelUsed,
+            keyIndexUsed: result.keyIndexUsed,
             elapsedMs: Date.now() - t0
         });
 
     } catch (err) {
         return c.json({
-            error: 'Hệ thống AI đang bận hoặc quá tải.',
+            error: 'Hệ thống AI đang bận hoặc tất cả Key dự phòng đều quá tải.',
             detail: err.message,
             elapsedMs: Date.now() - t0
         }, 503);
     }
 });
 
-/* ---------- HEALTH ---------- */
+/* ---------- HEALTH CHECK ---------- */
 app.get('/health', (c) => {
+    const rawKeys = c.env.GEMINI_KEYS || c.env.GEMINI_API_KEY || '';
+    const keyCount = rawKeys.split(',').map(k => k.trim()).filter(Boolean).length;
+
     return c.json({
         status: 'ok',
-        project: 'Heritage AI Assistant - Edge Version',
-        model: c.env.GEMINI_MODEL,
-        hasApiKey: !!c.env.GEMINI_API_KEY,
+        project: 'Heritage AI Assistant - Cloudflare Edge',
+        primaryModel: c.env.GEMINI_MODEL || 'gemini-2.5-flash',
+        totalKeysConfigured: keyCount,
         isSearchEnabled: true
     });
 });
 
-app.get('/', (c) => c.json({ message: 'Di Sản Thái Nguyên API is running on Cloudflare Edge!' }));
+app.get('/', (c) => c.json({ message: 'Di Sản Thái Nguyên API (Multi-Key Rotation) đang chạy trên Cloudflare Edge!' }));
 
-// Export app cho Cloudflare Workers
 export default app;

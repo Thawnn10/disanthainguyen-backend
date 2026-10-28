@@ -2,7 +2,6 @@ name = "disan-thainguyen-ai"
 main = "src/index.js"
 compatibility_date = "2024-03-20"
 
-# Cấu hình biến môi trường mặc định (API key sẽ được thêm bảo mật trên mây)
 [vars]
-GEMINI_MODEL = "gemini-2.0-flash"
-GEMINI_FALLBACK_MODELS = "gemini-2.5-flash,gemini-1.5-pro,gemini-1.5-flash"
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_FALLBACK_MODELS = "gemini-2.0-flash,gemini-1.5-flash"
