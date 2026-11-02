@@ -548,6 +548,7 @@ Nếu chưa đáp ứng được những yêu cầu cần thiết, hãy tra cứ
 
 /* ---------- HELPER FUNCTIONS ---------- */
 function backoffDelay(attempt) {
+    // Thời gian trễ ngẫu nhiên để tránh nghẽn mạng cục bộ
     return Math.min(1000 * Math.pow(2, attempt), 8000) + Math.floor(Math.random() * 500);
 }
 
@@ -555,9 +556,9 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-/* ---------- LOGIC: GỌI GEMINI XOAY VÒNG KEY & MODEL RETRY ---------- */
+/* ---------- LOGIC: GỌI GEMINI CÂN BẰNG TẢI TRÊN 10 KEY ---------- */
 async function callGeminiWithRetry(message, env) {
-    // 1. Lấy danh sách API Key (hỗ trợ cả GEMINI_KEYS phân tách bằng dấu phẩy hoặc GEMINI_API_KEY đơn lẻ)
+    // 1. Lấy và lọc danh sách API Keys
     const rawKeys = env.GEMINI_KEYS || env.GEMINI_API_KEY || '';
     const keys = rawKeys.split(',').map(k => k.trim()).filter(Boolean);
 
@@ -571,14 +572,25 @@ async function callGeminiWithRetry(message, env) {
     const modelsToTry = [...new Set([primaryModel, ...fallbackModels])];
 
     let errors = [];
+    
+    // TỐI ƯU HÓA: Chọn vị trí Key ngẫu nhiên để bắt đầu, tránh tình trạng Key đầu tiên bị dồn nén liên tục
+    const totalKeys = keys.length;
+    const startIndex = Math.floor(Math.random() * totalKeys); 
 
-    // 2. Vòng lặp duyệt qua từng API Key
-    for (let keyIdx = 0; keyIdx < keys.length; keyIdx++) {
-        const apiKey = keys[keyIdx];
+    // 2. Vòng lặp xoay vòng qua TẤT CẢ các API Key
+    for (let i = 0; i < totalKeys; i++) {
+        // Thuật toán vòng tròn (Wrap-around): Đi từ startIndex đến cuối, rồi quay lại 0
+        const currentKeyIndex = (startIndex + i) % totalKeys; 
+        const apiKey = keys[currentKeyIndex];
         const ai = new GoogleGenAI({ apiKey });
 
-        // Duyệt qua danh sách Model dự phòng
+        let isKeyRateLimited = false;
+
+        // 3. Duyệt qua danh sách Model dự phòng trên Key hiện tại
         for (const modelName of modelsToTry) {
+            
+            if (isKeyRateLimited) break; // Nếu Key này đã dính 429, bỏ qua luôn các Model khác, nhảy thẳng sang Key mới
+
             for (let attempt = 0; attempt < 2; attempt++) {
                 try {
                     const response = await ai.models.generateContent({
@@ -588,33 +600,36 @@ async function callGeminiWithRetry(message, env) {
                             systemInstruction: SYSTEM_INSTRUCTION,
                             temperature: 0.3,
                             maxOutputTokens: 2000,
-                            tools: [{ googleSearch: {} }] // Kích hoạt Google Search Grounding
+                            tools: [{ googleSearch: {} }] // Kích hoạt khả năng tự tra Google
                         }
                     });
 
                     if (!response.text) throw new Error('Model trả về rỗng');
 
+                    // Lấy nguồn link tra cứu (nếu AI có xài Google Search)
                     const searchChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
                     const sources = searchChunks.map(chunk => chunk.web?.uri).filter(Boolean);
 
                     return {
                         reply: response.text,
                         modelUsed: modelName,
-                        keyIndexUsed: keyIdx + 1,
+                        keyIndexUsed: currentKeyIndex + 1, // Để biết đang dùng Key số mấy
                         sources: [...new Set(sources)]
                     };
                 } catch (err) {
                     const msg = err?.message || String(err);
                     const isRateLimit = /429|quota|rate limit|resource_exhausted/i.test(msg);
 
-                    errors.push({ keyIndex: keyIdx + 1, model: modelName, attempt: attempt + 1, message: msg });
+                    errors.push({ keyIndex: currentKeyIndex + 1, model: modelName, attempt: attempt + 1, message: msg });
 
-                    // Nếu dính lỗi Rate Limit (429) -> Ngắt ngay lập tức để nhảy sang API Key tiếp theo
+                    // LỖI 429: Key này đã hết quota hoặc tốc độ => Dừng truy cập Key này ngay lập tức
                     if (isRateLimit) {
-                        console.warn(`[Key ${keyIdx + 1}] Chạm giới hạn 429. Đổi ngay sang Key tiếp theo...`);
-                        break;
+                        console.warn(`[Key ${currentKeyIndex + 1}] Bị dính Rate Limit (429). Nhảy sang Key tiếp theo...`);
+                        isKeyRateLimited = true;
+                        break; // Thoát khỏi vòng lặp attempt
                     }
 
+                    // Lỗi bình thường (như timeout mạng) -> Chờ rồi thử lại cùng Key này
                     const delay = backoffDelay(attempt);
                     await sleep(delay);
                 }
@@ -622,7 +637,7 @@ async function callGeminiWithRetry(message, env) {
         }
     }
 
-    throw new Error('Tất cả API Key và Model dự phòng đều bị quá tải. Chi tiết: ' + JSON.stringify(errors));
+    throw new Error('Tất cả ' + totalKeys + ' API Key đều đang bận hoặc quá tải. Chi tiết: ' + JSON.stringify(errors));
 }
 
 /* ---------- ROUTE: /api/chat ---------- */
@@ -631,7 +646,7 @@ app.post('/api/chat', async (c) => {
     const env = c.env;
 
     if (!env.GEMINI_KEYS && !env.GEMINI_API_KEY) {
-        return c.json({ error: 'Thiếu GEMINI_KEYS hoặc GEMINI_API_KEY trên Cloudflare' }, 503);
+        return c.json({ error: 'Thiếu cấu hình GEMINI_KEYS' }, 503);
     }
 
     try {
@@ -655,7 +670,7 @@ app.post('/api/chat', async (c) => {
 
     } catch (err) {
         return c.json({
-            error: 'Hệ thống AI đang bận hoặc tất cả Key dự phòng đều quá tải.',
+            error: 'Hệ thống AI đang bận hoặc tất cả API Key dự phòng đều đang tải nặng. Vui lòng thử lại sau vài giây.',
             detail: err.message,
             elapsedMs: Date.now() - t0
         }, 503);
@@ -669,13 +684,13 @@ app.get('/health', (c) => {
 
     return c.json({
         status: 'ok',
-        project: 'Heritage AI Assistant - Cloudflare Edge',
+        project: 'Heritage AI Assistant - Load Balanced Edge',
         primaryModel: c.env.GEMINI_MODEL || 'gemini-2.5-flash',
         totalKeysConfigured: keyCount,
         isSearchEnabled: true
     });
 });
 
-app.get('/', (c) => c.json({ message: 'Di Sản Thái Nguyên API (Multi-Key Rotation) đang chạy trên Cloudflare Edge!' }));
+app.get('/', (c) => c.json({ message: 'Di Sản Thái Nguyên API (Load Balancing Multi-Key) đang chạy ổn định!' }));
 
 export default app;
