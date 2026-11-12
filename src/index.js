@@ -556,13 +556,54 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-/* ---------- LOGIC: GỌI GEMINI CÂN BẰNG TẢI TRÊN 10 KEY ---------- */
+// Trích xuất danh sách API Key linh hoạt cho mọi số lượng key (7 key, 8 key, 10 key hoặc bất kỳ số lượng nào)
+function getApiKeys(env = {}) {
+    const keys = [];
+
+    // 1. Quét từ GEMINI_KEYS, GEMINI_API_KEY, GEMINI_KEY (hỗ trợ phân tách bằng dấu phẩy, chấm phẩy, hoặc xuống dòng)
+    const bulkSources = [env.GEMINI_KEYS, env.GEMINI_API_KEY, env.GEMINI_KEY];
+    for (const src of bulkSources) {
+        if (typeof src === 'string' && src.trim()) {
+            const parts = src
+                .split(/[,\n\r;]+/)
+                .map(k => k.trim().replace(/^['"]|['"]$/g, ''))
+                .filter(Boolean);
+            keys.push(...parts);
+        }
+    }
+
+    // 2. Tự động quét các biến môi trường riêng lẻ dạng: GEMINI_KEY_1..N, GEMINI_API_KEY_1..N, GEMINI_KEY1..N
+    const numberedEntries = [];
+    const numberedKeyRegex = /^GEMINI_(?:API_)?KEY_?(\d+)$/i;
+
+    for (const [propName, propVal] of Object.entries(env)) {
+        const match = propName.match(numberedKeyRegex);
+        if (match && typeof propVal === 'string' && propVal.trim()) {
+            const index = parseInt(match[1], 10);
+            const cleanVal = propVal.trim().replace(/^['"]|['"]$/g, '');
+            if (cleanVal) {
+                numberedEntries.push({ index, val: cleanVal });
+            }
+        }
+    }
+
+    // Sắp xếp các key đánh số theo đúng thứ tự (ví dụ: KEY_1, KEY_2, ..., KEY_7, KEY_8...)
+    numberedEntries.sort((a, b) => a.index - b.index);
+    for (const item of numberedEntries) {
+        keys.push(item.val);
+    }
+
+    // Loại bỏ các key trùng lặp nếu có, giữ nguyên danh sách hợp lệ
+    return [...new Set(keys)];
+}
+
+/* ---------- LOGIC: GỌI GEMINI CÂN BẰNG TẢI TRÊN BẤT KỲ SỐ LƯỢNG KEY (7, 8, 10,...) ---------- */
 async function callGeminiWithRetry(message, env) {
     // 1. Lấy và lọc danh sách API Keys
-    const rawKeys = env.GEMINI_KEYS || env.GEMINI_API_KEY || '';
-    const keys = rawKeys.split(',').map(k => k.trim()).filter(Boolean);
+    const keys = getApiKeys(env);
+    const totalKeys = keys.length;
 
-    if (keys.length === 0) {
+    if (totalKeys === 0) {
         throw new Error('Chưa cấu hình GEMINI_KEYS hoặc GEMINI_API_KEY');
     }
 
@@ -573,23 +614,22 @@ async function callGeminiWithRetry(message, env) {
 
     let errors = [];
     
-    // TỐI ƯU HÓA: Chọn vị trí Key ngẫu nhiên để bắt đầu, tránh tình trạng Key đầu tiên bị dồn nén liên tục
-    const totalKeys = keys.length;
-    const startIndex = Math.floor(Math.random() * totalKeys); 
+    // TỐI ƯU HÓA: Chọn vị trí Key ngẫu nhiên để bắt đầu trong tổng số keys, tránh dồn tải vào key đầu tiên
+    const startIndex = totalKeys > 1 ? Math.floor(Math.random() * totalKeys) : 0; 
 
-    // 2. Vòng lặp xoay vòng qua TẤT CẢ các API Key
+    // 2. Vòng lặp xoay vòng qua TẤT CẢ các API Key (dù có 7 key, 8 key, 10 key hay bất kỳ số lượng nào)
     for (let i = 0; i < totalKeys; i++) {
         // Thuật toán vòng tròn (Wrap-around): Đi từ startIndex đến cuối, rồi quay lại 0
         const currentKeyIndex = (startIndex + i) % totalKeys; 
         const apiKey = keys[currentKeyIndex];
         const ai = new GoogleGenAI({ apiKey });
 
-        let isKeyRateLimited = false;
+        let isKeyFailed = false;
 
         // 3. Duyệt qua danh sách Model dự phòng trên Key hiện tại
         for (const modelName of modelsToTry) {
             
-            if (isKeyRateLimited) break; // Nếu Key này đã dính 429, bỏ qua luôn các Model khác, nhảy thẳng sang Key mới
+            if (isKeyFailed) break; // Nếu Key này đã dính 429 hoặc lỗi key, bỏ qua luôn các Model khác, nhảy thẳng sang Key mới
 
             for (let attempt = 0; attempt < 2; attempt++) {
                 try {
@@ -613,19 +653,21 @@ async function callGeminiWithRetry(message, env) {
                     return {
                         reply: response.text,
                         modelUsed: modelName,
-                        keyIndexUsed: currentKeyIndex + 1, // Để biết đang dùng Key số mấy
+                        keyIndexUsed: currentKeyIndex + 1, // Để biết đang dùng Key số mấy (từ 1 đến totalKeys)
                         sources: [...new Set(sources)]
                     };
                 } catch (err) {
                     const msg = err?.message || String(err);
                     const isRateLimit = /429|quota|rate limit|resource_exhausted/i.test(msg);
+                    const isAuthError = /api_key_invalid|invalid api key|api key not valid|unauthorized|permission_denied|401|403/i.test(msg);
 
                     errors.push({ keyIndex: currentKeyIndex + 1, model: modelName, attempt: attempt + 1, message: msg });
 
-                    // LỖI 429: Key này đã hết quota hoặc tốc độ => Dừng truy cập Key này ngay lập tức
-                    if (isRateLimit) {
-                        console.warn(`[Key ${currentKeyIndex + 1}] Bị dính Rate Limit (429). Nhảy sang Key tiếp theo...`);
-                        isKeyRateLimited = true;
+                    // LỖI 429 HOẶC KEY HỎNG: Dừng truy cập Key này ngay lập tức để chuyển sang Key tiếp theo
+                    if (isRateLimit || isAuthError) {
+                        const reason = isRateLimit ? 'Rate Limit (429)' : 'Key không hợp lệ/hết hạn';
+                        console.warn(`[Key ${currentKeyIndex + 1}/${totalKeys}] Bị ${reason}. Nhảy sang Key tiếp theo...`);
+                        isKeyFailed = true;
                         break; // Thoát khỏi vòng lặp attempt
                     }
 
@@ -645,8 +687,9 @@ app.post('/api/chat', async (c) => {
     const t0 = Date.now();
     const env = c.env;
 
-    if (!env.GEMINI_KEYS && !env.GEMINI_API_KEY) {
-        return c.json({ error: 'Thiếu cấu hình GEMINI_KEYS' }, 503);
+    const keys = getApiKeys(env);
+    if (keys.length === 0) {
+        return c.json({ error: 'Thiếu cấu hình GEMINI_KEYS hoặc GEMINI_API_KEY' }, 503);
     }
 
     try {
@@ -679,14 +722,13 @@ app.post('/api/chat', async (c) => {
 
 /* ---------- HEALTH CHECK ---------- */
 app.get('/health', (c) => {
-    const rawKeys = c.env.GEMINI_KEYS || c.env.GEMINI_API_KEY || '';
-    const keyCount = rawKeys.split(',').map(k => k.trim()).filter(Boolean).length;
+    const keys = getApiKeys(c.env);
 
     return c.json({
         status: 'ok',
         project: 'Heritage AI Assistant - Load Balanced Edge',
         primaryModel: c.env.GEMINI_MODEL || 'gemini-2.5-flash',
-        totalKeysConfigured: keyCount,
+        totalKeysConfigured: keys.length,
         isSearchEnabled: true
     });
 });
