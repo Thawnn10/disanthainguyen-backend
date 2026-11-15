@@ -546,33 +546,71 @@ Nếu chưa đáp ứng được những yêu cầu cần thiết, hãy tra cứ
 **Sứ mệnh cuối cùng: Trở thành một trợ lý AI nghiên cứu di sản văn hóa đáng tin cậy, góp phần bảo tồn, lan tỏa và phát huy những giá trị văn hóa đặc sắc của Thái Nguyên và Việt Nam trên nền tảng thông tin chính xác, có nguồn gốc rõ ràng và tôn trọng sự thật lịch sử.**
 `.trim();
 
-/* ---------- HELPER FUNCTIONS ---------- */
+/* ---------- HELPER FUNCTIONS & CONFIG ---------- */
+const DEFAULT_PRIMARY_MODEL = 'gemini-3.8-flash';
+const DEFAULT_FALLBACK_MODELS = 'gemini-3.5-flash-lite,gemini-3.1-flash-lite';
+const MAX_SUBREQUESTS_PER_REQUEST = 42; // Giữ an toàn dưới giới hạn 50 subrequest/request của Cloudflare Workers Free
+const KEY_RATE_LIMIT_COOLDOWN_MS = 60 * 1000; // Tạm ưu tiên tránh cặp (key, model) vừa dính 429 trong 60s
+const KEY_AUTH_COOLDOWN_MS = 5 * 60 * 1000;   // Tạm ưu tiên tránh key hỏng/hết hạn trong 5 phút
+
+// Con trỏ xoay vòng toàn cục trong isolate để chia đều tải tuần tự qua từng request
+let roundRobinCursor = -1;
+const modelKeyCooldownUntil = new Map(); // `${apiKey}::${modelName}` -> timestamp
+const invalidKeyCooldownUntil = new Map(); // apiKey -> timestamp
+
 function backoffDelay(attempt) {
-    // Thời gian trễ ngẫu nhiên để tránh nghẽn mạng cục bộ
-    return Math.min(1000 * Math.pow(2, attempt), 8000) + Math.floor(Math.random() * 500);
+    // Thời gian trễ ngắn khi buộc phải thử lại trên cùng 1 key (trường hợp chỉ có 1-2 key)
+    return Math.min(500 * Math.pow(2, attempt), 2000) + Math.floor(Math.random() * 250);
 }
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Trích xuất danh sách API Key linh hoạt cho mọi số lượng key (7 key, 8 key, 10 key hoặc bất kỳ số lượng nào)
+function pruneExpiredCooldowns(now) {
+    for (const [k, until] of modelKeyCooldownUntil.entries()) {
+        if (until <= now) modelKeyCooldownUntil.delete(k);
+    }
+    for (const [k, until] of invalidKeyCooldownUntil.entries()) {
+        if (until <= now) invalidKeyCooldownUntil.delete(k);
+    }
+}
+
+// Trích xuất danh sách API Key linh hoạt cho mọi số lượng key (5, 6, 7, 10, 15, N key...)
 function getApiKeys(env = {}) {
     const keys = [];
 
-    // 1. Quét từ GEMINI_KEYS, GEMINI_API_KEY, GEMINI_KEY (hỗ trợ phân tách bằng dấu phẩy, chấm phẩy, hoặc xuống dòng)
+    // 1. Quét từ GEMINI_KEYS, GEMINI_API_KEY, GEMINI_KEY
+    // Hỗ trợ phân tách bằng dấu phẩy (,), chấm phẩy (;), xuống dòng (\n), khoảng trắng/tab hoặc JSON array
     const bulkSources = [env.GEMINI_KEYS, env.GEMINI_API_KEY, env.GEMINI_KEY];
     for (const src of bulkSources) {
         if (typeof src === 'string' && src.trim()) {
-            const parts = src
-                .split(/[,\n\r;]+/)
-                .map(k => k.trim().replace(/^['"]|['"]$/g, ''))
+            const trimmed = src.trim();
+            if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+                try {
+                    const parsed = JSON.parse(trimmed);
+                    if (Array.isArray(parsed)) {
+                        for (const item of parsed) {
+                            if (typeof item === 'string' && item.trim()) {
+                                keys.push(item.trim().replace(/^['"]|['"]$/g, ''));
+                            }
+                        }
+                        continue;
+                    }
+                } catch (_) {
+                    // Không phải JSON hợp lệ -> fallback sang tách chuỗi thông thường
+                }
+            }
+
+            const parts = trimmed
+                .split(/[,\s;]+/)
+                .map(k => k.trim().replace(/^['"\[\]]+|['"\[\]]+$/g, ''))
                 .filter(Boolean);
             keys.push(...parts);
         }
     }
 
-    // 2. Tự động quét các biến môi trường riêng lẻ dạng: GEMINI_KEY_1..N, GEMINI_API_KEY_1..N, GEMINI_KEY1..N
+    // 2. Tự động quét các biến môi trường đánh số riêng lẻ: GEMINI_KEY_1..N, GEMINI_API_KEY_1..N, GEMINI_KEY1..N
     const numberedEntries = [];
     const numberedKeyRegex = /^GEMINI_(?:API_)?KEY_?(\d+)$/i;
 
@@ -587,17 +625,134 @@ function getApiKeys(env = {}) {
         }
     }
 
-    // Sắp xếp các key đánh số theo đúng thứ tự (ví dụ: KEY_1, KEY_2, ..., KEY_7, KEY_8...)
     numberedEntries.sort((a, b) => a.index - b.index);
     for (const item of numberedEntries) {
         keys.push(item.val);
     }
 
-    // Loại bỏ các key trùng lặp nếu có, giữ nguyên danh sách hợp lệ
+    // Loại bỏ trùng lặp và giữ nguyên thứ tự
     return [...new Set(keys)];
 }
 
-/* ---------- LOGIC: GỌI GEMINI CÂN BẰNG TẢI TRÊN BẤT KỲ SỐ LƯỢNG KEY (7, 8, 10,...) ---------- */
+function getFallbackModels(env = {}) {
+    const fallbackString = env.GEMINI_FALLBACK_MODELS || DEFAULT_FALLBACK_MODELS;
+    return fallbackString
+        .split(/[,\s;]+/)
+        .map(s => s.trim())
+        .filter(Boolean);
+}
+
+function extractResponseText(response) {
+    if (!response) return '';
+    try {
+        if (typeof response.text === 'string' && response.text.trim()) {
+            return response.text.trim();
+        }
+    } catch (_) {
+        // Bỏ qua nếu getter response.text ném lỗi khi response có parts đặc biệt
+    }
+    try {
+        const parts = response.candidates?.[0]?.content?.parts || [];
+        return parts
+            .filter(p => p && !p.thought && typeof p.text === 'string')
+            .map(p => p.text)
+            .join('')
+            .trim();
+    } catch (_) {
+        return '';
+    }
+}
+
+function classifyError(err) {
+    const msg = err?.message || String(err);
+    const status = Number(err?.status || err?.code || 0);
+
+    const isRateLimit =
+        status === 429 ||
+        /"code"\s*:\s*429|\b429\b|quota|rate.?limit|resource_exhausted|too many requests/i.test(msg);
+
+    const isAuthError =
+        status === 401 ||
+        status === 403 ||
+        /"code"\s*:\s*(401|403)|api_key_invalid|invalid_api_key|invalid api key|api key not valid|api key expired|permission_denied|unauthenticated|leaked/i.test(msg);
+
+    const isModelUnsupported =
+        status === 404 ||
+        /"code"\s*:\s*404|model.*not found|is not found for api version|not supported for generatecontent|deprecated/i.test(msg);
+
+    const isSearchUnsupported =
+        (status === 400 || /"code"\s*:\s*400|invalid_argument/i.test(msg)) &&
+        /search|grounding|google_search|tool/i.test(msg);
+
+    return {
+        status,
+        shortMessage: msg.length > 220 ? msg.slice(0, 220) + '...' : msg,
+        isRateLimit,
+        isAuthError,
+        isModelUnsupported,
+        isSearchUnsupported
+    };
+}
+
+function getOrderedKeyIndicesForModel(baseOrder, keys, modelName, deadKeysThisRequest) {
+    const now = Date.now();
+    const healthy = [];
+    const cooledDown = [];
+
+    for (const idx of baseOrder) {
+        const apiKey = keys[idx];
+        if (deadKeysThisRequest.has(apiKey)) continue;
+
+        const authUntil = invalidKeyCooldownUntil.get(apiKey) || 0;
+        if (authUntil > now) continue;
+
+        const rateUntil = modelKeyCooldownUntil.get(`${apiKey}::${modelName}`) || 0;
+        if (rateUntil > now) {
+            cooledDown.push(idx);
+        } else {
+            healthy.push(idx);
+        }
+    }
+
+    // Luôn ưu tiên các key khỏe mạnh trước, sau đó vẫn thử lại key đang cooldown phòng trường hợp quota (RPM) đã hồi
+    const combined = [...healthy, ...cooledDown];
+    if (combined.length > 0) return combined;
+
+    // Fallback cuối cùng: nếu tất cả key đều từng bị đánh dấu auth cooldown từ trước, vẫn thử lại toàn bộ trừ key vừa chết ở request này
+    return baseOrder.filter(idx => !deadKeysThisRequest.has(keys[idx]));
+}
+
+async function invokeGemini(ai, modelName, message, useSearch) {
+    const isModernGemini = /^gemini-(3\.[58]|4)/i.test(modelName);
+    const config = {
+        systemInstruction: SYSTEM_INSTRUCTION,
+        maxOutputTokens: 8192,
+        ...(isModernGemini ? {} : { temperature: 0.3 }),
+        ...(useSearch ? { tools: [{ googleSearch: {} }] } : {})
+    };
+
+    const response = await ai.models.generateContent({
+        model: modelName,
+        contents: [{ role: 'user', parts: [{ text: message }] }],
+        config
+    });
+
+    const reply = extractResponseText(response);
+    if (!reply) {
+        const finishReason = response?.candidates?.[0]?.finishReason || 'UNKNOWN';
+        throw new Error(`Model trả về rỗng (finishReason=${finishReason})`);
+    }
+
+    const searchChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+    const sources = searchChunks.map(chunk => chunk.web?.uri).filter(Boolean);
+
+    return {
+        reply,
+        sources: [...new Set(sources)]
+    };
+}
+
+/* ---------- LOGIC: GỌI GEMINI XOAY VÒNG THỰC SỰ QUA SỐ KEY BẤT KỲ (5, 6, 7, 10, 15...) ---------- */
 async function callGeminiWithRetry(message, env) {
     // 1. Lấy và lọc danh sách API Keys
     const keys = getApiKeys(env);
@@ -607,79 +762,127 @@ async function callGeminiWithRetry(message, env) {
         throw new Error('Chưa cấu hình GEMINI_KEYS hoặc GEMINI_API_KEY');
     }
 
-    const primaryModel = env.GEMINI_MODEL || 'gemini-2.5-flash';
-    const fallbackString = env.GEMINI_FALLBACK_MODELS || 'gemini-2.0-flash,gemini-1.5-flash';
-    const fallbackModels = fallbackString.split(',').map(s => s.trim()).filter(Boolean);
+    const now = Date.now();
+    pruneExpiredCooldowns(now);
+
+    const primaryModel = (env.GEMINI_MODEL || DEFAULT_PRIMARY_MODEL).trim();
+    const fallbackModels = getFallbackModels(env);
     const modelsToTry = [...new Set([primaryModel, ...fallbackModels])];
 
-    let errors = [];
-    
-    // TỐI ƯU HÓA: Chọn vị trí Key ngẫu nhiên để bắt đầu trong tổng số keys, tránh dồn tải vào key đầu tiên
-    const startIndex = totalKeys > 1 ? Math.floor(Math.random() * totalKeys) : 0; 
+    // 2. Xoay vòng con trỏ toàn cục qua từng request (lần đầu chọn ngẫu nhiên, các lần sau tiến tuần tự)
+    if (roundRobinCursor < 0 || roundRobinCursor >= totalKeys) {
+        roundRobinCursor = Math.floor(Math.random() * totalKeys);
+    }
+    const startIndex = roundRobinCursor;
+    roundRobinCursor = (roundRobinCursor + 1) % totalKeys;
 
-    // 2. Vòng lặp xoay vòng qua TẤT CẢ các API Key (dù có 7 key, 8 key, 10 key hay bất kỳ số lượng nào)
+    const baseKeyOrder = [];
     for (let i = 0; i < totalKeys; i++) {
-        // Thuật toán vòng tròn (Wrap-around): Đi từ startIndex đến cuối, rồi quay lại 0
-        const currentKeyIndex = (startIndex + i) % totalKeys; 
-        const apiKey = keys[currentKeyIndex];
-        const ai = new GoogleGenAI({ apiKey });
+        baseKeyOrder.push((startIndex + i) % totalKeys);
+    }
 
-        let isKeyFailed = false;
+    const errors = [];
+    const deadKeysThisRequest = new Set();
+    const deadModelsThisRequest = new Set();
+    const searchUnsupportedModels = new Set();
+    const rateLimitedPairsThisRequest = new Set();
+    const clients = new Map();
 
-        // 3. Duyệt qua danh sách Model dự phòng trên Key hiện tại
+    const getClient = (apiKey) => {
+        if (!clients.has(apiKey)) {
+            clients.set(apiKey, new GoogleGenAI({ apiKey }));
+        }
+        return clients.get(apiKey);
+    };
+
+    const passes = [true, false]; // Vòng 1: bật Google Search; Vòng 2 (dự phòng): tắt Google Search nếu lỗi tool/rỗng
+    let subrequestsUsed = 0;
+
+    // 3. Xoay vòng qua TẤT CẢ các API Key cho từng Model (ưu tiên Model chính, rồi mới tới Model dự phòng)
+    for (const allowSearch of passes) {
         for (const modelName of modelsToTry) {
-            
-            if (isKeyFailed) break; // Nếu Key này đã dính 429 hoặc lỗi key, bỏ qua luôn các Model khác, nhảy thẳng sang Key mới
+            if (subrequestsUsed >= MAX_SUBREQUESTS_PER_REQUEST) break;
+            if (deadModelsThisRequest.has(modelName)) continue;
 
-            for (let attempt = 0; attempt < 2; attempt++) {
-                try {
-                    const response = await ai.models.generateContent({
-                        model: modelName,
-                        contents: [{ role: 'user', parts: [{ text: message }] }],
-                        config: {
-                            systemInstruction: SYSTEM_INSTRUCTION,
-                            temperature: 0.3,
-                            maxOutputTokens: 2000,
-                            tools: [{ googleSearch: {} }] // Kích hoạt khả năng tự tra Google
+            const keyIndices = getOrderedKeyIndicesForModel(baseKeyOrder, keys, modelName, deadKeysThisRequest);
+            if (keyIndices.length === 0) break;
+
+            // Khi có >= 3 key, xoay sang key kế tiếp ngay lập tức (0ms delay) thay vì chờ retry trên cùng 1 key
+            const maxAttemptsPerKey = allowSearch && totalKeys <= 2 ? 2 : 1;
+
+            for (const keyIdx of keyIndices) {
+                if (subrequestsUsed >= MAX_SUBREQUESTS_PER_REQUEST) break;
+                if (deadModelsThisRequest.has(modelName)) break;
+
+                const apiKey = keys[keyIdx];
+                const pairKey = `${apiKey}::${modelName}`;
+
+                // Vòng dự phòng tắt search bỏ qua các cặp (key, model) đã dính 429 ở vòng 1
+                if (!allowSearch && rateLimitedPairsThisRequest.has(pairKey)) continue;
+
+                const ai = getClient(apiKey);
+                const useSearch = allowSearch && !searchUnsupportedModels.has(modelName);
+
+                for (let attempt = 0; attempt < maxAttemptsPerKey; attempt++) {
+                    if (subrequestsUsed >= MAX_SUBREQUESTS_PER_REQUEST) break;
+                    subrequestsUsed++;
+
+                    try {
+                        const result = await invokeGemini(ai, modelName, message, useSearch);
+                        modelKeyCooldownUntil.delete(pairKey);
+                        invalidKeyCooldownUntil.delete(apiKey);
+
+                        return {
+                            reply: result.reply,
+                            modelUsed: modelName,
+                            keyIndexUsed: keyIdx + 1,
+                            sources: result.sources
+                        };
+                    } catch (err) {
+                        const classified = classifyError(err);
+                        errors.push({
+                            keyIndex: keyIdx + 1,
+                            model: modelName,
+                            attempt: attempt + 1,
+                            useSearch,
+                            message: classified.shortMessage
+                        });
+
+                        if (classified.isAuthError) {
+                            deadKeysThisRequest.add(apiKey);
+                            invalidKeyCooldownUntil.set(apiKey, Date.now() + KEY_AUTH_COOLDOWN_MS);
+                            console.warn(`[Key ${keyIdx + 1}/${totalKeys}] Lỗi xác thực/Key không hợp lệ. Tạm bỏ qua key này.`);
+                            break;
                         }
-                    });
 
-                    if (!response.text) throw new Error('Model trả về rỗng');
+                        if (classified.isRateLimit) {
+                            rateLimitedPairsThisRequest.add(pairKey);
+                            modelKeyCooldownUntil.set(pairKey, Date.now() + KEY_RATE_LIMIT_COOLDOWN_MS);
+                            console.warn(`[Key ${keyIdx + 1}/${totalKeys}] Hết quota (429) trên ${modelName}. Xoay sang Key tiếp theo...`);
+                            break;
+                        }
 
-                    // Lấy nguồn link tra cứu (nếu AI có xài Google Search)
-                    const searchChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-                    const sources = searchChunks.map(chunk => chunk.web?.uri).filter(Boolean);
+                        if (classified.isModelUnsupported) {
+                            deadModelsThisRequest.add(modelName);
+                            console.warn(`[Model ${modelName}] Không khả dụng/404. Chuyển sang Model dự phòng...`);
+                            break;
+                        }
 
-                    return {
-                        reply: response.text,
-                        modelUsed: modelName,
-                        keyIndexUsed: currentKeyIndex + 1, // Để biết đang dùng Key số mấy (từ 1 đến totalKeys)
-                        sources: [...new Set(sources)]
-                    };
-                } catch (err) {
-                    const msg = err?.message || String(err);
-                    const isRateLimit = /429|quota|rate limit|resource_exhausted/i.test(msg);
-                    const isAuthError = /api_key_invalid|invalid api key|api key not valid|unauthorized|permission_denied|401|403/i.test(msg);
+                        if (classified.isSearchUnsupported && useSearch) {
+                            searchUnsupportedModels.add(modelName);
+                            break;
+                        }
 
-                    errors.push({ keyIndex: currentKeyIndex + 1, model: modelName, attempt: attempt + 1, message: msg });
-
-                    // LỖI 429 HOẶC KEY HỎNG: Dừng truy cập Key này ngay lập tức để chuyển sang Key tiếp theo
-                    if (isRateLimit || isAuthError) {
-                        const reason = isRateLimit ? 'Rate Limit (429)' : 'Key không hợp lệ/hết hạn';
-                        console.warn(`[Key ${currentKeyIndex + 1}/${totalKeys}] Bị ${reason}. Nhảy sang Key tiếp theo...`);
-                        isKeyFailed = true;
-                        break; // Thoát khỏi vòng lặp attempt
+                        if (attempt < maxAttemptsPerKey - 1) {
+                            await sleep(backoffDelay(attempt));
+                        }
                     }
-
-                    // Lỗi bình thường (như timeout mạng) -> Chờ rồi thử lại cùng Key này
-                    const delay = backoffDelay(attempt);
-                    await sleep(delay);
                 }
             }
         }
     }
 
-    throw new Error('Tất cả ' + totalKeys + ' API Key đều đang bận hoặc quá tải. Chi tiết: ' + JSON.stringify(errors));
+    throw new Error('Tất cả ' + totalKeys + ' API Key đều đang bận hoặc đã hết quota. Chi tiết: ' + JSON.stringify(errors.slice(-10)));
 }
 
 /* ---------- ROUTE: /api/chat ---------- */
@@ -727,7 +930,8 @@ app.get('/health', (c) => {
     return c.json({
         status: 'ok',
         project: 'Heritage AI Assistant - Load Balanced Edge',
-        primaryModel: c.env.GEMINI_MODEL || 'gemini-2.5-flash',
+        primaryModel: c.env.GEMINI_MODEL || DEFAULT_PRIMARY_MODEL,
+        fallbackModels: getFallbackModels(c.env),
         totalKeysConfigured: keys.length,
         isSearchEnabled: true
     });
