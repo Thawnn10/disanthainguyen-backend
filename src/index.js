@@ -552,11 +552,13 @@ const DEFAULT_FALLBACK_MODELS = 'gemini-3.5-flash-lite,gemini-3.1-flash-lite';
 const MAX_SUBREQUESTS_PER_REQUEST = 42; // Giữ an toàn dưới giới hạn 50 subrequest/request của Cloudflare Workers Free
 const KEY_RATE_LIMIT_COOLDOWN_MS = 60 * 1000; // Tạm ưu tiên tránh cặp (key, model) vừa dính 429 trong 60s
 const KEY_AUTH_COOLDOWN_MS = 5 * 60 * 1000;   // Tạm ưu tiên tránh key hỏng/hết hạn trong 5 phút
+const MODEL_SEARCH_COOLDOWN_MS = 5 * 60 * 1000; // Nếu Google Search bị chặn trên Free Tier, tạm bỏ qua search trong 5 phút để không lãng phí subrequest
 
 // Con trỏ xoay vòng toàn cục trong isolate để chia đều tải tuần tự qua từng request
 let roundRobinCursor = -1;
-const modelKeyCooldownUntil = new Map(); // `${apiKey}::${modelName}` -> timestamp
+const modelKeyCooldownUntil = new Map(); // `${apiKey}::${modelName}::${search|plain}` -> timestamp
 const invalidKeyCooldownUntil = new Map(); // apiKey -> timestamp
+const modelSearchCooldownUntil = new Map(); // modelName -> timestamp
 
 function backoffDelay(attempt) {
     // Thời gian trễ ngắn khi buộc phải thử lại trên cùng 1 key (trường hợp chỉ có 1-2 key)
@@ -573,6 +575,9 @@ function pruneExpiredCooldowns(now) {
     }
     for (const [k, until] of invalidKeyCooldownUntil.entries()) {
         if (until <= now) invalidKeyCooldownUntil.delete(k);
+    }
+    for (const [k, until] of modelSearchCooldownUntil.entries()) {
+        if (until <= now) modelSearchCooldownUntil.delete(k);
     }
 }
 
@@ -680,9 +685,11 @@ function classifyError(err) {
         status === 404 ||
         /"code"\s*:\s*404|model.*not found|is not found for api version|not supported for generatecontent|deprecated/i.test(msg);
 
+    const isSearchRelated = /search|grounding|google_search|tool|billing/i.test(msg);
+
     const isSearchUnsupported =
         (status === 400 || /"code"\s*:\s*400|invalid_argument/i.test(msg)) &&
-        /search|grounding|google_search|tool/i.test(msg);
+        isSearchRelated;
 
     return {
         status,
@@ -690,14 +697,16 @@ function classifyError(err) {
         isRateLimit,
         isAuthError,
         isModelUnsupported,
+        isSearchRelated,
         isSearchUnsupported
     };
 }
 
-function getOrderedKeyIndicesForModel(baseOrder, keys, modelName, deadKeysThisRequest) {
+function getOrderedKeyIndicesForModel(baseOrder, keys, modelName, useSearch, deadKeysThisRequest) {
     const now = Date.now();
     const healthy = [];
     const cooledDown = [];
+    const modeTag = useSearch ? 'search' : 'plain';
 
     for (const idx of baseOrder) {
         const apiKey = keys[idx];
@@ -706,7 +715,7 @@ function getOrderedKeyIndicesForModel(baseOrder, keys, modelName, deadKeysThisRe
         const authUntil = invalidKeyCooldownUntil.get(apiKey) || 0;
         if (authUntil > now) continue;
 
-        const rateUntil = modelKeyCooldownUntil.get(`${apiKey}::${modelName}`) || 0;
+        const rateUntil = modelKeyCooldownUntil.get(`${apiKey}::${modelName}::${modeTag}`) || 0;
         if (rateUntil > now) {
             cooledDown.push(idx);
         } else {
@@ -723,7 +732,7 @@ function getOrderedKeyIndicesForModel(baseOrder, keys, modelName, deadKeysThisRe
 }
 
 async function invokeGemini(ai, modelName, message, useSearch) {
-    const isModernGemini = /^gemini-(3\.[58]|4)/i.test(modelName);
+    const isModernGemini = /^gemini-(3|4)/i.test(modelName);
     const config = {
         systemInstruction: SYSTEM_INSTRUCTION,
         maxOutputTokens: 8192,
@@ -785,7 +794,8 @@ async function callGeminiWithRetry(message, env) {
     const deadKeysThisRequest = new Set();
     const deadModelsThisRequest = new Set();
     const searchUnsupportedModels = new Set();
-    const rateLimitedPairsThisRequest = new Set();
+    const searchFailedModels = new Set();
+    const alreadyRanWithoutSearch = new Set();
     const clients = new Map();
 
     const getClient = (apiKey) => {
@@ -795,42 +805,56 @@ async function callGeminiWithRetry(message, env) {
         return clients.get(apiKey);
     };
 
-    const passes = [true, false]; // Vòng 1: bật Google Search; Vòng 2 (dự phòng): tắt Google Search nếu lỗi tool/rỗng
+    // Dành tối thiểu suất subrequest cho vòng dự phòng không-search (rất quan trọng với Free Tier khi googleSearch bị limit: 0)
+    const reservedNoSearchBudget = Math.min(totalKeys, 12);
+    const maxPass1Subrequests = Math.max(totalKeys, MAX_SUBREQUESTS_PER_REQUEST - reservedNoSearchBudget);
+
+    const passes = [true, false]; // Vòng 1: bật Google Search; Vòng 2 (dự phòng): tắt Google Search nếu tool/free tier chặn search
     let subrequestsUsed = 0;
 
     // 3. Xoay vòng qua TẤT CẢ các API Key cho từng Model (ưu tiên Model chính, rồi mới tới Model dự phòng)
     for (const allowSearch of passes) {
-        for (const modelName of modelsToTry) {
-            if (subrequestsUsed >= MAX_SUBREQUESTS_PER_REQUEST) break;
-            if (deadModelsThisRequest.has(modelName)) continue;
+        const passLimit = allowSearch ? maxPass1Subrequests : MAX_SUBREQUESTS_PER_REQUEST;
 
-            const keyIndices = getOrderedKeyIndicesForModel(baseKeyOrder, keys, modelName, deadKeysThisRequest);
+        for (const modelName of modelsToTry) {
+            if (subrequestsUsed >= passLimit) break;
+            if (deadModelsThisRequest.has(modelName)) continue;
+            if (!allowSearch && alreadyRanWithoutSearch.has(modelName)) continue;
+
+            const isSearchCoolingDown = (modelSearchCooldownUntil.get(modelName) || 0) > Date.now();
+            const initialUseSearch = allowSearch && !searchUnsupportedModels.has(modelName) && !isSearchCoolingDown;
+
+            const keyIndices = getOrderedKeyIndicesForModel(baseKeyOrder, keys, modelName, initialUseSearch, deadKeysThisRequest);
             if (keyIndices.length === 0) break;
 
             // Khi có >= 3 key, xoay sang key kế tiếp ngay lập tức (0ms delay) thay vì chờ retry trên cùng 1 key
             const maxAttemptsPerKey = allowSearch && totalKeys <= 2 ? 2 : 1;
 
             for (const keyIdx of keyIndices) {
-                if (subrequestsUsed >= MAX_SUBREQUESTS_PER_REQUEST) break;
+                if (subrequestsUsed >= passLimit) break;
                 if (deadModelsThisRequest.has(modelName)) break;
 
                 const apiKey = keys[keyIdx];
-                const pairKey = `${apiKey}::${modelName}`;
-
-                // Vòng dự phòng tắt search bỏ qua các cặp (key, model) đã dính 429 ở vòng 1
-                if (!allowSearch && rateLimitedPairsThisRequest.has(pairKey)) continue;
-
                 const ai = getClient(apiKey);
-                const useSearch = allowSearch && !searchUnsupportedModels.has(modelName);
+                const useSearch = allowSearch && !searchUnsupportedModels.has(modelName) && !isSearchCoolingDown;
+                const pairKey = `${apiKey}::${modelName}::${useSearch ? 'search' : 'plain'}`;
+
+                if (!useSearch) {
+                    alreadyRanWithoutSearch.add(modelName);
+                }
 
                 for (let attempt = 0; attempt < maxAttemptsPerKey; attempt++) {
-                    if (subrequestsUsed >= MAX_SUBREQUESTS_PER_REQUEST) break;
+                    if (subrequestsUsed >= passLimit) break;
                     subrequestsUsed++;
 
                     try {
                         const result = await invokeGemini(ai, modelName, message, useSearch);
                         modelKeyCooldownUntil.delete(pairKey);
                         invalidKeyCooldownUntil.delete(apiKey);
+
+                        if (!useSearch && searchFailedModels.has(modelName)) {
+                            modelSearchCooldownUntil.set(modelName, Date.now() + MODEL_SEARCH_COOLDOWN_MS);
+                        }
 
                         return {
                             reply: result.reply,
@@ -848,6 +872,14 @@ async function callGeminiWithRetry(message, env) {
                             message: classified.shortMessage
                         });
 
+                        // Nếu lỗi 403/400 liên quan đến tính năng Search Grounding (Free Tier chưa bật Billing) -> tắt search trên model này, KHÔNG giết key
+                        if (useSearch && (classified.isSearchUnsupported || (classified.isAuthError && classified.isSearchRelated))) {
+                            searchUnsupportedModels.add(modelName);
+                            searchFailedModels.add(modelName);
+                            console.warn(`[Model ${modelName}] Google Search bị chặn trên Free Tier/model. Chuyển sang chế độ không search...`);
+                            break;
+                        }
+
                         if (classified.isAuthError) {
                             deadKeysThisRequest.add(apiKey);
                             invalidKeyCooldownUntil.set(apiKey, Date.now() + KEY_AUTH_COOLDOWN_MS);
@@ -856,9 +888,9 @@ async function callGeminiWithRetry(message, env) {
                         }
 
                         if (classified.isRateLimit) {
-                            rateLimitedPairsThisRequest.add(pairKey);
+                            if (useSearch) searchFailedModels.add(modelName);
                             modelKeyCooldownUntil.set(pairKey, Date.now() + KEY_RATE_LIMIT_COOLDOWN_MS);
-                            console.warn(`[Key ${keyIdx + 1}/${totalKeys}] Hết quota (429) trên ${modelName}. Xoay sang Key tiếp theo...`);
+                            console.warn(`[Key ${keyIdx + 1}/${totalKeys}] Hết quota (429) trên ${modelName} (search=${useSearch}). Xoay sang Key tiếp theo...`);
                             break;
                         }
 
@@ -868,9 +900,8 @@ async function callGeminiWithRetry(message, env) {
                             break;
                         }
 
-                        if (classified.isSearchUnsupported && useSearch) {
-                            searchUnsupportedModels.add(modelName);
-                            break;
+                        if (useSearch) {
+                            searchFailedModels.add(modelName);
                         }
 
                         if (attempt < maxAttemptsPerKey - 1) {
@@ -883,6 +914,11 @@ async function callGeminiWithRetry(message, env) {
     }
 
     throw new Error('Tất cả ' + totalKeys + ' API Key đều đang bận hoặc đã hết quota. Chi tiết: ' + JSON.stringify(errors.slice(-10)));
+}
+
+function maskApiKey(key) {
+    if (!key || key.length <= 10) return '****';
+    return `${key.slice(0, 6)}...${key.slice(-4)}`;
 }
 
 /* ---------- ROUTE: /api/chat ---------- */
@@ -935,6 +971,109 @@ app.get('/health', (c) => {
         totalKeysConfigured: keys.length,
         isSearchEnabled: true
     });
+});
+
+/* ---------- HEALTH DEEP (CHẨN ĐOÁN CHI TIẾT TỪNG KEY & MODEL) ---------- */
+app.get('/health/deep', async (c) => {
+    const t0 = Date.now();
+    const keys = getApiKeys(c.env);
+    const primaryModel = (c.env.GEMINI_MODEL || DEFAULT_PRIMARY_MODEL).trim();
+    const fallbackModels = getFallbackModels(c.env);
+    const models = [...new Set([primaryModel, ...fallbackModels])];
+
+    if (keys.length === 0) {
+        return c.json({ ok: false, error: 'Chưa cấu hình GEMINI_KEYS' }, 503);
+    }
+
+    const keyResults = [];
+    const maxKeysToProbe = Math.min(keys.length, 15);
+
+    // 1. Kiểm tra lần lượt từng Key (không search) với primaryModel
+    for (let i = 0; i < maxKeysToProbe; i++) {
+        const apiKey = keys[i];
+        const ai = new GoogleGenAI({ apiKey });
+        try {
+            const res = await ai.models.generateContent({
+                model: primaryModel,
+                contents: [{ role: 'user', parts: [{ text: 'Trả lời 1 chữ: OK' }] }],
+                config: { maxOutputTokens: 32 }
+            });
+            const text = extractResponseText(res);
+            keyResults.push({
+                keyIndex: i + 1,
+                keyMasked: maskApiKey(apiKey),
+                model: primaryModel,
+                ok: Boolean(text),
+                sample: text.slice(0, 30)
+            });
+        } catch (err) {
+            const classified = classifyError(err);
+            keyResults.push({
+                keyIndex: i + 1,
+                keyMasked: maskApiKey(apiKey),
+                model: primaryModel,
+                ok: false,
+                status: classified.status,
+                error: classified.shortMessage
+            });
+        }
+    }
+
+    // 2. Thử 1 lần bật googleSearch trên Key đầu tiên tìm được hoặc Key #1
+    let searchCheck = null;
+    try {
+        const firstWorkingIdx = keyResults.findIndex(r => r.ok);
+        const testIdx = firstWorkingIdx >= 0 ? firstWorkingIdx : 0;
+        const ai = new GoogleGenAI({ apiKey: keys[testIdx] });
+        const res = await ai.models.generateContent({
+            model: primaryModel,
+            contents: [{ role: 'user', parts: [{ text: 'Thái Nguyên ở đâu? Trả lời ngắn.' }] }],
+            config: { maxOutputTokens: 128, tools: [{ googleSearch: {} }] }
+        });
+        searchCheck = {
+            keyIndex: testIdx + 1,
+            ok: Boolean(extractResponseText(res))
+        };
+    } catch (err) {
+        const classified = classifyError(err);
+        searchCheck = {
+            ok: false,
+            status: classified.status,
+            error: classified.shortMessage
+        };
+    }
+
+    // 3. Nếu primaryModel thất bại ở toàn bộ key, thử fallbackModels trên Key #1
+    const fallbackChecks = [];
+    if (keyResults.every(r => !r.ok) && fallbackModels.length > 0) {
+        const ai = new GoogleGenAI({ apiKey: keys[0] });
+        for (const fbModel of fallbackModels.slice(0, 3)) {
+            try {
+                const res = await ai.models.generateContent({
+                    model: fbModel,
+                    contents: [{ role: 'user', parts: [{ text: 'Trả lời 1 chữ: OK' }] }],
+                    config: { maxOutputTokens: 32 }
+                });
+                fallbackChecks.push({ model: fbModel, ok: Boolean(extractResponseText(res)) });
+            } catch (err) {
+                const classified = classifyError(err);
+                fallbackChecks.push({ model: fbModel, ok: false, status: classified.status, error: classified.shortMessage });
+            }
+        }
+    }
+
+    const workingCount = keyResults.filter(r => r.ok).length;
+    return c.json({
+        ok: workingCount > 0,
+        totalKeysConfigured: keys.length,
+        keysProbed: maxKeysToProbe,
+        workingKeysCount: workingCount,
+        modelsConfigured: models,
+        searchCheck,
+        keyResults,
+        fallbackChecks,
+        elapsedMs: Date.now() - t0
+    }, workingCount > 0 ? 200 : 503);
 });
 
 app.get('/', (c) => c.json({ message: 'Di Sản Thái Nguyên API (Load Balancing Multi-Key) đang chạy ổn định!' }));
