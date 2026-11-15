@@ -672,6 +672,10 @@ function classifyError(err) {
     const msg = err?.message || String(err);
     const status = Number(err?.status || err?.code || 0);
 
+    const isLocationBlocked =
+        /user location is not supported/i.test(msg) ||
+        (status === 400 && /failed_precondition/i.test(msg) && /location|region|country/i.test(msg));
+
     const isRateLimit =
         status === 429 ||
         /"code"\s*:\s*429|\b429\b|quota|rate.?limit|resource_exhausted|too many requests/i.test(msg);
@@ -694,6 +698,7 @@ function classifyError(err) {
     return {
         status,
         shortMessage: msg.length > 220 ? msg.slice(0, 220) + '...' : msg,
+        isLocationBlocked,
         isRateLimit,
         isAuthError,
         isModelUnsupported,
@@ -761,8 +766,24 @@ async function invokeGemini(ai, modelName, message, useSearch) {
     };
 }
 
+function getEdgeInfo(c) {
+    const cf = c?.req?.raw?.cf;
+    return {
+        colo: cf?.colo || 'unknown',
+        country: cf?.country || 'unknown'
+    };
+}
+
+function createGeminiClient(apiKey, env) {
+    const baseUrl = (env?.GEMINI_BASE_URL || '').trim();
+    if (baseUrl) {
+        return new GoogleGenAI({ apiKey, httpOptions: { baseUrl } });
+    }
+    return new GoogleGenAI({ apiKey });
+}
+
 /* ---------- LOGIC: GỌI GEMINI XOAY VÒNG THỰC SỰ QUA SỐ KEY BẤT KỲ (5, 6, 7, 10, 15...) ---------- */
-async function callGeminiWithRetry(message, env) {
+async function callGeminiWithRetry(message, env, meta = {}) {
     // 1. Lấy và lọc danh sách API Keys
     const keys = getApiKeys(env);
     const totalKeys = keys.length;
@@ -800,7 +821,7 @@ async function callGeminiWithRetry(message, env) {
 
     const getClient = (apiKey) => {
         if (!clients.has(apiKey)) {
-            clients.set(apiKey, new GoogleGenAI({ apiKey }));
+            clients.set(apiKey, createGeminiClient(apiKey, env));
         }
         return clients.get(apiKey);
     };
@@ -872,6 +893,17 @@ async function callGeminiWithRetry(message, env) {
                             message: classified.shortMessage
                         });
 
+                        // Nếu Cloudflare Edge PoP bị Google chặn khu vực (VD: HKG -> "User location is not supported"),
+                        // dừng ngay thay vì thử toàn bộ các key/model khác từ cùng 1 PoP IP
+                        if (classified.isLocationBlocked) {
+                            const coloInfo = meta?.edgeColo && meta.edgeColo !== 'unknown'
+                                ? ` (Edge PoP: ${meta.edgeColo})`
+                                : '';
+                            throw new Error(
+                                `Google Gemini API chặn khu vực IP của Cloudflare Worker${coloInfo}: User location is not supported. Cần đặt biến GEMINI_BASE_URL trỏ qua proxy ở Singapore/US hoặc host backend ở Singapore/US.`
+                            );
+                        }
+
                         // Nếu lỗi 403/400 liên quan đến tính năng Search Grounding (Free Tier chưa bật Billing) -> tắt search trên model này, KHÔNG giết key
                         if (useSearch && (classified.isSearchUnsupported || (classified.isAuthError && classified.isSearchRelated))) {
                             searchUnsupportedModels.add(modelName);
@@ -925,6 +957,7 @@ function maskApiKey(key) {
 app.post('/api/chat', async (c) => {
     const t0 = Date.now();
     const env = c.env;
+    const edge = getEdgeInfo(c);
 
     const keys = getApiKeys(env);
     if (keys.length === 0) {
@@ -939,7 +972,7 @@ app.post('/api/chat', async (c) => {
             return c.json({ error: 'Câu hỏi không hợp lệ' }, 400);
         }
 
-        const result = await callGeminiWithRetry(message, env);
+        const result = await callGeminiWithRetry(message, env, { edgeColo: edge.colo });
 
         return c.json({
             reply: result.reply,
@@ -954,6 +987,7 @@ app.post('/api/chat', async (c) => {
         return c.json({
             error: 'Hệ thống AI đang bận hoặc tất cả API Key dự phòng đều đang tải nặng. Vui lòng thử lại sau vài giây.',
             detail: err.message,
+            edgeColo: edge.colo,
             elapsedMs: Date.now() - t0
         }, 503);
     }
@@ -962,6 +996,7 @@ app.post('/api/chat', async (c) => {
 /* ---------- HEALTH CHECK ---------- */
 app.get('/health', (c) => {
     const keys = getApiKeys(c.env);
+    const edge = getEdgeInfo(c);
 
     return c.json({
         status: 'ok',
@@ -969,7 +1004,9 @@ app.get('/health', (c) => {
         primaryModel: c.env.GEMINI_MODEL || DEFAULT_PRIMARY_MODEL,
         fallbackModels: getFallbackModels(c.env),
         totalKeysConfigured: keys.length,
-        isSearchEnabled: true
+        isSearchEnabled: true,
+        edgeColo: edge.colo,
+        edgeCountry: edge.country
     });
 });
 
@@ -977,6 +1014,7 @@ app.get('/health', (c) => {
 app.get('/health/deep', async (c) => {
     const t0 = Date.now();
     const keys = getApiKeys(c.env);
+    const edge = getEdgeInfo(c);
     const primaryModel = (c.env.GEMINI_MODEL || DEFAULT_PRIMARY_MODEL).trim();
     const fallbackModels = getFallbackModels(c.env);
     const models = [...new Set([primaryModel, ...fallbackModels])];
@@ -987,11 +1025,12 @@ app.get('/health/deep', async (c) => {
 
     const keyResults = [];
     const maxKeysToProbe = Math.min(keys.length, 15);
+    let locationBlocked = false;
 
     // 1. Kiểm tra lần lượt từng Key (không search) với primaryModel
     for (let i = 0; i < maxKeysToProbe; i++) {
         const apiKey = keys[i];
-        const ai = new GoogleGenAI({ apiKey });
+        const ai = createGeminiClient(apiKey, c.env);
         try {
             const res = await ai.models.generateContent({
                 model: primaryModel,
@@ -1008,6 +1047,7 @@ app.get('/health/deep', async (c) => {
             });
         } catch (err) {
             const classified = classifyError(err);
+            if (classified.isLocationBlocked) locationBlocked = true;
             keyResults.push({
                 keyIndex: i + 1,
                 keyMasked: maskApiKey(apiKey),
@@ -1024,7 +1064,7 @@ app.get('/health/deep', async (c) => {
     try {
         const firstWorkingIdx = keyResults.findIndex(r => r.ok);
         const testIdx = firstWorkingIdx >= 0 ? firstWorkingIdx : 0;
-        const ai = new GoogleGenAI({ apiKey: keys[testIdx] });
+        const ai = createGeminiClient(keys[testIdx], c.env);
         const res = await ai.models.generateContent({
             model: primaryModel,
             contents: [{ role: 'user', parts: [{ text: 'Thái Nguyên ở đâu? Trả lời ngắn.' }] }],
@@ -1036,6 +1076,7 @@ app.get('/health/deep', async (c) => {
         };
     } catch (err) {
         const classified = classifyError(err);
+        if (classified.isLocationBlocked) locationBlocked = true;
         searchCheck = {
             ok: false,
             status: classified.status,
@@ -1046,7 +1087,7 @@ app.get('/health/deep', async (c) => {
     // 3. Nếu primaryModel thất bại ở toàn bộ key, thử fallbackModels trên Key #1
     const fallbackChecks = [];
     if (keyResults.every(r => !r.ok) && fallbackModels.length > 0) {
-        const ai = new GoogleGenAI({ apiKey: keys[0] });
+        const ai = createGeminiClient(keys[0], c.env);
         for (const fbModel of fallbackModels.slice(0, 3)) {
             try {
                 const res = await ai.models.generateContent({
@@ -1057,14 +1098,27 @@ app.get('/health/deep', async (c) => {
                 fallbackChecks.push({ model: fbModel, ok: Boolean(extractResponseText(res)) });
             } catch (err) {
                 const classified = classifyError(err);
+                if (classified.isLocationBlocked) locationBlocked = true;
                 fallbackChecks.push({ model: fbModel, ok: false, status: classified.status, error: classified.shortMessage });
             }
         }
     }
 
     const workingCount = keyResults.filter(r => r.ok).length;
+    let diagnosticHint = null;
+    if (locationBlocked) {
+        diagnosticHint = `Cloudflare Edge PoP (${edge.colo}) đang bị Google chặn khu vực ("User location is not supported"). Cần đặt biến GEMINI_BASE_URL qua proxy ở Singapore/US hoặc deploy backend ở Singapore/US.`;
+    } else if (searchCheck && !searchCheck.ok && searchCheck.status === 429) {
+        diagnosticHint = 'Google Search Grounding đang hết quota Free Tier (429), nhưng các câu trả lời AI không cần Search vẫn hoạt động bình thường.';
+    }
+
     return c.json({
         ok: workingCount > 0,
+        edgeColo: edge.colo,
+        edgeCountry: edge.country,
+        locationBlocked,
+        usingCustomBaseUrl: Boolean((c.env?.GEMINI_BASE_URL || '').trim()),
+        diagnosticHint,
         totalKeysConfigured: keys.length,
         keysProbed: maxKeysToProbe,
         workingKeysCount: workingCount,
