@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { GoogleGenAI } from '@google/genai';
+import { DurableObject } from 'cloudflare:workers';
 
 const app = new Hono();
 
@@ -768,9 +769,19 @@ async function invokeGemini(ai, modelName, message, useSearch) {
 
 function getEdgeInfo(c) {
     const cf = c?.req?.raw?.cf;
+    const headers = c?.req?.raw?.headers;
+    const headerColo = typeof headers?.get === 'function' ? headers.get('x-cf-edge-colo') : null;
+    const headerCountry = typeof headers?.get === 'function' ? headers.get('x-cf-edge-country') : null;
+    const doHintHeader = typeof headers?.get === 'function' ? headers.get('x-do-region-hint') : null;
+    const configuredHint = (c?.env?.GEMINI_DO_REGION || 'wnam').trim() || 'wnam';
+
     return {
-        colo: cf?.colo || 'unknown',
-        country: cf?.country || 'unknown'
+        colo: headerColo || cf?.colo || 'unknown',
+        country: headerCountry || cf?.country || 'unknown',
+        executionColo: doHintHeader ? (cf?.colo || `do:${doHintHeader}`) : (cf?.colo || 'unknown'),
+        routedViaDO: Boolean(doHintHeader),
+        doRegionHint: doHintHeader || configuredHint,
+        doBindingConfigured: Boolean(c?.env?.GEMINI_EXECUTOR)
     };
 }
 
@@ -972,7 +983,7 @@ app.post('/api/chat', async (c) => {
             return c.json({ error: 'Câu hỏi không hợp lệ' }, 400);
         }
 
-        const result = await callGeminiWithRetry(message, env, { edgeColo: edge.colo });
+        const result = await callGeminiWithRetry(message, env, { edgeColo: edge.executionColo || edge.colo });
 
         return c.json({
             reply: result.reply,
@@ -988,6 +999,8 @@ app.post('/api/chat', async (c) => {
             error: 'Hệ thống AI đang bận hoặc tất cả API Key dự phòng đều đang tải nặng. Vui lòng thử lại sau vài giây.',
             detail: err.message,
             edgeColo: edge.colo,
+            executionColo: edge.executionColo,
+            routedViaDO: edge.routedViaDO,
             elapsedMs: Date.now() - t0
         }, 503);
     }
@@ -1006,7 +1019,9 @@ app.get('/health', (c) => {
         totalKeysConfigured: keys.length,
         isSearchEnabled: true,
         edgeColo: edge.colo,
-        edgeCountry: edge.country
+        edgeCountry: edge.country,
+        doBindingConfigured: edge.doBindingConfigured,
+        doRegionHint: edge.doRegionHint
     });
 });
 
@@ -1107,7 +1122,9 @@ app.get('/health/deep', async (c) => {
     const workingCount = keyResults.filter(r => r.ok).length;
     let diagnosticHint = null;
     if (locationBlocked) {
-        diagnosticHint = `Cloudflare Edge PoP (${edge.colo}) đang bị Google chặn khu vực ("User location is not supported"). Cần đặt biến GEMINI_BASE_URL qua proxy ở Singapore/US hoặc deploy backend ở Singapore/US.`;
+        diagnosticHint = edge.routedViaDO
+            ? `Durable Object (${edge.executionColo}, hint=${edge.doRegionHint}) vẫn bị Google chặn khu vực. Thử đổi GEMINI_DO_REGION (VD: "enam" hoặc "wnam") hoặc dùng GEMINI_BASE_URL.`
+            : `Cloudflare Edge PoP (${edge.colo}) đang bị Google chặn khu vực ("User location is not supported"). Cần binding GEMINI_EXECUTOR hoặc GEMINI_BASE_URL qua proxy Singapore/US.`;
     } else if (searchCheck && !searchCheck.ok && searchCheck.status === 429) {
         diagnosticHint = 'Google Search Grounding đang hết quota Free Tier (429), nhưng các câu trả lời AI không cần Search vẫn hoạt động bình thường.';
     }
@@ -1116,6 +1133,10 @@ app.get('/health/deep', async (c) => {
         ok: workingCount > 0,
         edgeColo: edge.colo,
         edgeCountry: edge.country,
+        executionColo: edge.executionColo,
+        routedViaDO: edge.routedViaDO,
+        doRegionHint: edge.doRegionHint,
+        doBindingConfigured: edge.doBindingConfigured,
         locationBlocked,
         usingCustomBaseUrl: Boolean((c.env?.GEMINI_BASE_URL || '').trim()),
         diagnosticHint,
@@ -1132,4 +1153,61 @@ app.get('/health/deep', async (c) => {
 
 app.get('/', (c) => c.json({ message: 'Di Sản Thái Nguyên API (Load Balancing Multi-Key) đang chạy ổn định!' }));
 
-export default app;
+/**
+ * Durable Object đặt tại vùng được Google Gemini hỗ trợ (mặc định wnam - US West)
+ * để tránh Cloudflare Edge định tuyến qua HKG gây lỗi "User location is not supported".
+ */
+export class GeminiRegionExecutor extends DurableObject {
+    async fetch(request) {
+        return app.fetch(request, this.env, {
+            waitUntil: (promise) => this.ctx.waitUntil(promise)
+        });
+    }
+}
+
+async function forwardToRegionalExecutor(request, env, ctx) {
+    const regionHint = (env.GEMINI_DO_REGION || 'wnam').trim() || 'wnam';
+    const doId = env.GEMINI_EXECUTOR.idFromName(`gemini-executor-${regionHint}-v1`);
+    const stub = env.GEMINI_EXECUTOR.get(doId, { locationHint: regionHint });
+
+    const headers = new Headers(request.headers);
+    headers.set('x-cf-edge-colo', request.cf?.colo || 'unknown');
+    headers.set('x-cf-edge-country', request.cf?.country || 'unknown');
+    headers.set('x-do-region-hint', regionHint);
+
+    const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
+    const bodyBuffer = hasBody ? await request.arrayBuffer() : undefined;
+
+    const doRequest = new Request(request.url, {
+        method: request.method,
+        headers,
+        body: bodyBuffer
+    });
+
+    try {
+        return await stub.fetch(doRequest);
+    } catch (doErr) {
+        console.warn('[DO Fallback] Không gọi được GeminiRegionExecutor, chuyển về Edge trực tiếp:', doErr?.message || doErr);
+        const fallbackReq = new Request(request.url, {
+            method: request.method,
+            headers: request.headers,
+            body: bodyBuffer
+        });
+        return app.fetch(fallbackReq, env, ctx);
+    }
+}
+
+export default {
+    async fetch(request, env, ctx) {
+        const url = new URL(request.url);
+        const needsSupportedRegion =
+            (url.pathname === '/api/chat' && request.method === 'POST') ||
+            (url.pathname === '/health/deep' && request.method === 'GET');
+
+        if (needsSupportedRegion && env?.GEMINI_EXECUTOR && !(env?.GEMINI_BASE_URL || '').trim()) {
+            return forwardToRegionalExecutor(request, env, ctx);
+        }
+
+        return app.fetch(request, env, ctx);
+    }
+};
